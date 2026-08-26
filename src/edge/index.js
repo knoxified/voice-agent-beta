@@ -132,7 +132,7 @@ app.post('/twiml/web-call', async (c) => {
   return twimlResponse(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="${streamUrl}" />
+    <Stream url="${escapeXml(streamUrl)}" />
   </Connect>
 </Response>`);
 });
@@ -172,7 +172,7 @@ async function handleTwilioInbound(c, body) {
   return twimlResponse(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="${streamUrl}" />
+    <Stream url="${escapeXml(streamUrl)}" />
   </Connect>
 </Response>`);
 }
@@ -249,7 +249,12 @@ function sayAndHangup(text) {
 }
 
 function escapeXml(text) {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
 }
 
 function twimlResponse(xml) {
