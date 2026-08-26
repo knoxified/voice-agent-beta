@@ -1,9 +1,13 @@
 # Environment variables
 .env
 .env.*
+.dev.vars
 
 # Dependencies
 node_modules/
+
+# Cloudflare Workers
+.wrangler/
 
 # Logs
 *.log

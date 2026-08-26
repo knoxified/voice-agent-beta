@@ -176,15 +176,20 @@ async function checkQuota(userId) {
 }
 
 // ─── Record voice usage at end of call ────────────────────
-async function deductMinutes(userId, minutesUsed) {
+// Calls the deduct_voice_minutes() DB function rather than inserting into
+// voice_usage directly. That function does two inserts: one into voice_usage
+// (what checkQuota/the dashboard read from) and one into the usage table
+// with feature_key='voice_minutes' — the second one is what the
+// check_credit_warnings trigger listens for. A raw insert here was silently
+// skipping that path entirely, so real calls were never triggering credit
+// warnings the way automation runs do.
+async function deductMinutes(userId, minutesUsed, sessionId) {
   try {
-    const { error } = await supabase
-      .from('voice_usage')
-      .insert({
-        user_id: userId,
-        minutes_used: minutesUsed,
-        cost_units: Math.ceil(minutesUsed * 0.01)
-      });
+    const { error } = await supabase.rpc('deduct_voice_minutes', {
+      p_user_id: userId,
+      p_minutes: minutesUsed,
+      p_session_id: sessionId || null
+    });
 
     if (error) {
       console.error('[Supabase] deductMinutes error:', error.message);
@@ -196,11 +201,39 @@ async function deductMinutes(userId, minutesUsed) {
   }
 }
 
+// ─── Persist the full call transcript at end of call ──────
+// messages is the session's running conversation array (system/user/assistant
+// turns). Best-effort: a failure here should never break call cleanup.
+async function saveCallTranscript(userId, callId, callerNumber, provider, durationSecs, messages) {
+  try {
+    const { error } = await supabase
+      .from('call_transcripts')
+      .insert({
+        user_id: userId,
+        call_id: callId,
+        caller_number: callerNumber || null,
+        provider: provider || null,
+        duration_secs: durationSecs || 0,
+        // Drop the leading system prompt — it's not part of the actual conversation.
+        messages: (messages || []).filter((m) => m.role !== 'system')
+      });
+
+    if (error) {
+      console.error('[Supabase] saveCallTranscript error:', error.message);
+    } else {
+      console.log(`[Supabase] Saved transcript for call ${callId}`);
+    }
+  } catch (err) {
+    console.error('[Supabase] saveCallTranscript exception:', err.message);
+  }
+}
+
 module.exports = {
   supabase,
   getUserByPhone,
   getUserById,
   getUserVoiceSettings,
   checkQuota,
-  deductMinutes
+  deductMinutes,
+  saveCallTranscript
 };

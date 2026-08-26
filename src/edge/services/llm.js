@@ -1,27 +1,28 @@
-const Groq = require('groq-sdk');
+import Groq from 'groq-sdk';
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-
-const MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-20b';
 // openai/gpt-oss-* are reasoning models: they spend part of the token budget
 // on an internal reasoning step before writing the final answer into
-// `content`. With a small budget (e.g. 80 tokens) that reasoning step alone
-// can consume the whole thing, leaving `content` empty even though real
-// tokens were used. Reasoning models need more headroom, and since this is a
-// low-latency voice agent, we want fast/short replies, not deep
-// chain-of-thought — so reasoning_effort is kept low.
-const IS_REASONING_MODEL = MODEL.startsWith('openai/gpt-oss');
+// `content`. With a small budget that reasoning step alone can consume the
+// whole thing, leaving `content` empty. Reasoning models need more headroom,
+// and since this is a low-latency voice agent, reasoning_effort is kept low.
+function isReasoningModel(model) {
+  return model.startsWith('openai/gpt-oss');
+}
 
-async function generateResponse(messages) {
+async function generateResponse(env, messages) {
+  const groq = new Groq({ apiKey: env.GROQ_API_KEY });
+  const MODEL = env.GROQ_MODEL || 'openai/gpt-oss-20b';
+  const reasoningModel = isReasoningModel(MODEL);
+
   try {
     const params = {
       model: MODEL,
       messages,
-      max_tokens: IS_REASONING_MODEL ? 300 : 80,
+      max_tokens: reasoningModel ? 300 : 80,
       temperature: 0.7,
-      stream: false
+      stream: false,
     };
-    if (IS_REASONING_MODEL) {
+    if (reasoningModel) {
       params.reasoning_effort = 'low';
     }
 
@@ -35,11 +36,10 @@ async function generateResponse(messages) {
     }
 
     return response || null;
-
   } catch (err) {
     console.error('[LLM] Groq error:', err.message);
     throw err;
   }
 }
 
-module.exports = { generateResponse };
+export { generateResponse };

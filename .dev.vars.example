@@ -1,0 +1,30 @@
+# For LOCAL testing only: copy this file to .dev.vars and fill in real values.
+# `wrangler dev` reads .dev.vars automatically -- it is NOT committed to git.
+#
+# For PRODUCTION, these same values go in the Cloudflare dashboard instead:
+# Workers & Pages -> voice-agent-beta -> Settings -> Variables and Secrets
+# (add each as a "Secret", not a plain text "Variable", since these are
+# credentials).
+
+SUPABASE_URL=https://elpljgrwrzaugsunoidf.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=
+
+GROQ_API_KEY=
+# Optional -- defaults to openai/gpt-oss-20b if not set.
+GROQ_MODEL=
+
+DEEPGRAM_API_KEY=
+
+CARTESIA_API_KEY=
+CARTESIA_VOICE_ID_DEFAULT=e07c00bc-4134-4eae-9ea4-1a55fb45746b
+
+TTS_PROVIDER=cartesia
+
+TWILIO_ACCOUNT_SID=
+TWILIO_API_KEY=
+TWILIO_API_SECRET=
+TWILIO_TWIML_APP_SID=
+
+N8N_BASE_URL=
+N8N_WEBHOOK_BOOK=webhook/appointment-webhook
+N8N_WEBHOOK_LEADREACH=webhook/leadreach

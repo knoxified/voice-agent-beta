@@ -1,4 +1,4 @@
-const { checkQuota, getUserByPhone, getUserVoiceSettings } = require('../services/supabase');
+const { checkQuota, getUserByPhone, getUserVoiceSettings, saveCallTranscript } = require('../services/supabase');
 const { initSession, destroySession, getSession } = require('../services/session');
 const { deductMinutes } = require('../services/quota');
 const { makeOutboundCall } = require('../services/telnyx');  // only needed for Telnyx outbound
@@ -241,8 +241,21 @@ async function handleCallEnd(callId, durationSecs) {
 
     const minutesUsed = Math.ceil(durationSecs / 60);
     if (minutesUsed > 0) {
-      await deductMinutes(session.userId, minutesUsed);
+      await deductMinutes(session.userId, minutesUsed, callId);
       console.log(`[Call End] User ${session.userId} used ${minutesUsed} min`);
+    }
+
+    // Persist transcript (best-effort — session.messages may be undefined if the
+    // call never reached the media stream, e.g. no-answer/busy/failed calls).
+    if (session.messages && session.messages.length > 0) {
+      await saveCallTranscript(
+        session.userId,
+        callId,
+        session.callerNumber,
+        session.provider,
+        durationSecs,
+        session.messages
+      );
     }
 
     await destroySession(callId);

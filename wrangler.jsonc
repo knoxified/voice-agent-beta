@@ -1,0 +1,33 @@
+{
+  "name": "voice-agent-beta",
+  "main": "src/edge/index.js",
+  "compatibility_date": "2026-08-01",
+  "observability": {
+    "enabled": true
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CALL_SESSION",
+        "class_name": "CallSession"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["CallSession"]
+    }
+  ],
+  "vars": {
+    "TWILIO_TWIML_APP_SID": "AP37499d8dc8149959ed68910df75083ad",
+    "CARTESIA_VOICE_ID_DEFAULT": "e07c00bc-4134-4eae-9ea4-1a55fb45746b",
+    "PORT": "3000",
+    "NODE_ENV": "production",
+    "BASE_URL": "https://voice.knoxified.org",
+    "SUPABASE_URL": "https://elpljgrwrzaugsunoidf.supabase.co",
+    "STT_PROVIDER": "deepgram",
+    "TTS_PROVIDER": "cartesia",
+    "N8N_WEBHOOK_URL": "http://localhost:5678/webhook"
+  }
+}
