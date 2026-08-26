@@ -132,7 +132,10 @@ app.post('/twiml/web-call', async (c) => {
   return twimlResponse(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="${escapeXml(streamUrl)}" />
+    <Stream url="${escapeXml(streamUrl)}">
+      <Parameter name="userId" value="${escapeXml(userId)}" />
+      <Parameter name="provider" value="web" />
+    </Stream>
   </Connect>
 </Response>`);
 });
@@ -172,7 +175,11 @@ async function handleTwilioInbound(c, body) {
   return twimlResponse(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="${escapeXml(streamUrl)}" />
+    <Stream url="${escapeXml(streamUrl)}">
+      <Parameter name="userId" value="${escapeXml(user.id)}" />
+      <Parameter name="callerNumber" value="${escapeXml(From)}" />
+      <Parameter name="provider" value="twilio" />
+    </Stream>
   </Connect>
 </Response>`);
 }

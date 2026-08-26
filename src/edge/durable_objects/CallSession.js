@@ -181,6 +181,26 @@ export class CallSession {
       this.callId = msg.start.call_control_id;
     }
 
+    // TwiML <Connect><Stream> doesn't reliably pass a query string on the
+    // wss:// URL through to this actual WebSocket upgrade request -- the
+    // documented, reliable way to get custom data through is nested
+    // <Parameter> elements on the <Stream> tag, delivered here as
+    // msg.start.customParameters. Prefer those; keep the URL-derived
+    // values (set in handleStreamUpgrade) as a fallback for providers
+    // that don't go through TwiML (Telnyx's streaming_start command
+    // passes stream_url directly, so its query string isn't subject to
+    // this limitation).
+    if (msg.start?.customParameters?.userId) {
+      this.userId = msg.start.customParameters.userId;
+    }
+    if (msg.start?.customParameters?.callerNumber) {
+      this.callerNumber = msg.start.customParameters.callerNumber;
+    }
+    if (msg.start?.customParameters?.provider) {
+      this.provider = msg.start.customParameters.provider;
+      this.isWebCall = this.provider === 'web';
+    }
+
     console.log(`[Stream] Start event | streamSid: ${this.streamSid} | callId: ${this.callId} | userId: ${this.userId}`);
 
     if (!this.userId || !this.callId) {
