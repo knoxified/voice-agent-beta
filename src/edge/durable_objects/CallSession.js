@@ -418,43 +418,15 @@ Today: ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeri
   }
 }
 
-function base64ToBytes(b64) {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  const lookup = new Uint8Array(256);
-  for (let i = 0; i < chars.length; i++) lookup[chars.charCodeAt(i)] = i;
-
-  const len = b64.length;
-  let bytes = [];
-  for (let i = 0; i < len; i += 4) {
-    const c1 = lookup[b64.charCodeAt(i)];
-    const c2 = lookup[b64.charCodeAt(i + 1)];
-    const c3 = lookup[b64.charCodeAt(i + 2)];
-    const c4 = lookup[b64.charCodeAt(i + 3)];
-
-    bytes.push((c1 << 2) | (c2 >> 4));
-    if (c3 < 64) bytes.push(((c2 & 15) << 4) | (c3 >> 2));
-    if (c4 < 64) bytes.push(((c3 & 3) << 6) | c4);
-  }
-  return new Uint8Array(bytes);
+function base64ToBytes(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
 }
 
 function bytesToBase64(bytes) {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  let result = '';
-  let i = 0;
-  while (i < bytes.length) {
-    const b1 = bytes[i++] || 0;
-    const b2 = bytes[i++] || 0;
-    const b3 = bytes[i++] || 0;
-
-    const e1 = b1 >> 2;
-    const e2 = ((b1 & 3) << 4) | (b2 >> 4);
-    const e3 = ((b2 & 15) << 2) | (b3 >> 6);
-    const e4 = b3 & 63;
-
-    result += chars[e1] + chars[e2];
-    result += i - 1 < bytes.length + 1 ? chars[e3] : '=';
-    result += i < bytes.length + 1 ? chars[e4] : '=';
-  }
-  return result;
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
 }
