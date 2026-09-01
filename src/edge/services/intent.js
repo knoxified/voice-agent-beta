@@ -30,26 +30,71 @@ function detectIntent(transcript) {
 }
 
 function buildN8nPayload(intent, session, transcript) {
-  const base = {
-    tenantId: session.tenantId,
-    callerNumber: session.callerNumber,
-    transcript,
-    intentType: intent.type,
-    timestamp: new Date().toISOString()
-  };
-
-  if (intent.type === 'book_appointment' || intent.type === 'check_availability') {
+  if (intent.type === 'check_availability') {
     return {
-      ...base,
-      tool: intent.type === 'check_availability' ? 'checkAvailableSlot' : 'bookAppointment',
-      startTime: extractDateTime(transcript),
-      name: extractName(session.messages),
-      email: null,
-      phone: session.callerNumber
+      userId: session.userId,
+      // NOTE: this is the OAuth provider (Google Calendar), unrelated to
+      // session.provider (which means the telephony channel: web/twilio/
+      // telnyx). Hardcoded because Google is the only real, configured
+      // OAuth provider right now -- see knoxified-auth's providers.js.
+      provider: 'google',
+      tool: 'checkAvailableSlot',
+      date: extractDate(transcript),
+      duration: extractDuration(transcript),
     };
   }
 
-  return base;
+  if (intent.type === 'book_appointment') {
+    const duration = extractDuration(transcript);
+    const startTime = extractDateTime(transcript);
+    return {
+      userId: session.userId,
+      provider: 'google',
+      name: extractName(session.messages) || 'Phone caller',
+      email: extractEmail(transcript),
+      phone: session.callerNumber,
+      startTime,
+      endTime: startTime ? addMinutesIso(startTime, duration) : null,
+      notes: extractNotes(transcript),
+    };
+  }
+
+  // cancel_appointment / get_info: no n8n webhook wired up for these yet
+  // (see webhookMap in n8n.js) -- returning null here rather than a
+  // payload shaped for a webhook that doesn't exist.
+  return null;
+}
+
+function extractDate(transcript) {
+  const now = new Date();
+  const d = /tomorrow/i.test(transcript) ? new Date(now.getTime() + 86400000) : now;
+  return d.toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+function extractDuration(transcript) {
+  const hourMatch = transcript.match(/\b(an?|1)\s*hour\b/i);
+  if (hourMatch) return 60;
+  const halfMatch = transcript.match(/\bhalf\s*(an?\s*)?hour\b/i);
+  if (halfMatch) return 30;
+  const minMatch = transcript.match(/\b(\d{1,3})\s*min(ute)?s?\b/i);
+  if (minMatch) return parseInt(minMatch[1], 10);
+  return 30; // default slot length, matches AppointMate's own default
+}
+
+function addMinutesIso(iso, minutes) {
+  return new Date(new Date(iso).getTime() + minutes * 60000).toISOString();
+}
+
+function extractEmail(transcript) {
+  const match = transcript.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+  return match ? match[0] : null;
+}
+
+function extractNotes(transcript) {
+  // Becomes the Google Calendar event title (AppointMate's `summary`
+  // field) -- keep it short. Falls back to a generic label rather than
+  // dumping the raw transcript in as the event title.
+  return transcript && transcript.length <= 120 ? transcript : 'Booked via AI voice agent call';
 }
 
 function extractDateTime(transcript) {
