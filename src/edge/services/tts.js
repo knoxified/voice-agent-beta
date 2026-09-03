@@ -2,14 +2,14 @@
 // axios nor Buffer are reliable in the Workers runtime; fetch and
 // ArrayBuffer/Uint8Array are native Web APIs Workers is built around.
 
-async function synthesizeSpeech(env, text) {
+async function synthesizeSpeech(env, text, voiceId) {
   if (!text || text.trim().length === 0) return null;
   const provider = env.TTS_PROVIDER || 'cartesia';
-  if (provider === 'cartesia') return synthesizeCartesia(env, text);
-  return synthesizeTelnyx(env, text);
+  if (provider === 'cartesia') return synthesizeCartesia(env, text, voiceId);
+  return synthesizeTelnyx(env, text, voiceId);
 }
 
-async function synthesizeCartesia(env, text) {
+async function synthesizeCartesia(env, text, voiceId) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8000); // 8s max
 
@@ -18,15 +18,22 @@ async function synthesizeCartesia(env, text) {
       method: 'POST',
       headers: {
         'X-API-Key': env.CARTESIA_API_KEY,
-        'Cartesia-Version': '2024-06-10',
+        // sonic-2 was fully discontinued by Cartesia on 2026-06-01 (see
+        // docs.cartesia.ai/changelog/2026) -- calls made against it since
+        // then have been failing. sonic-3 is the current stable model and
+        // needs a newer API version header.
+        'Cartesia-Version': '2026-03-01',
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model_id: 'sonic-2',
+        model_id: env.CARTESIA_MODEL_ID || 'sonic-3',
         transcript: text,
         voice: {
           mode: 'id',
-          id: env.CARTESIA_VOICE_ID_DEFAULT || env.CARTESIA_VOICE_ID || 'e07c00bc-4134-4eae-9ea4-1a55fb45746b',
+          // Per-client voice choice (user_voice_settings.preferred_voice_id)
+          // wins when present; falls back to env default, then the
+          // hardcoded default voice.
+          id: voiceId || env.CARTESIA_VOICE_ID_DEFAULT || env.CARTESIA_VOICE_ID || 'e07c00bc-4134-4eae-9ea4-1a55fb45746b',
         },
         output_format: {
           container: 'raw',

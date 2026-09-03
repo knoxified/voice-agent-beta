@@ -6,6 +6,7 @@ import { triggerAutomation } from '../services/n8n.js';
 import {
   getUserById,
   getUserVoiceSettings,
+  getAgentConfig,
   getRemainingMinutes,
   deductMinutes,
   saveCallTranscript,
@@ -34,6 +35,7 @@ export class CallSession {
     this.remainingMinutesAtStart = null;
     this.minuteWarningPlayed = false;
     this.quotaExceededMessage = null;
+    this.voiceId = null;
   }
 
   async fetch(request) {
@@ -71,11 +73,11 @@ export class CallSession {
           method: 'POST',
           headers: {
             'X-API-Key': this.env.CARTESIA_API_KEY,
-            'Cartesia-Version': '2024-06-10',
+            'Cartesia-Version': '2026-03-01',
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({
-            model_id: 'sonic-2',
+            model_id: this.env.CARTESIA_MODEL_ID || 'sonic-3',
             transcript: 'test',
             voice: {
               mode: 'id',
@@ -215,16 +217,20 @@ export class CallSession {
     this.isTrial = user?.isTrial || false;
     console.log(`[Stream] User loaded | isTrial: ${this.isTrial}`);
 
-    const voiceSettings = await getUserVoiceSettings(this.env, this.userId);
+    const [voiceSettings, agentConfig] = await Promise.all([
+      getUserVoiceSettings(this.env, this.userId),
+      getAgentConfig(this.env, this.userId),
+    ]);
     this.quotaExceededMessage = voiceSettings.quota_exceeded_message;
+    this.voiceId = voiceSettings.preferred_voice_id;
 
     this.remainingMinutesAtStart = await getRemainingMinutes(this.env, this.userId);
 
     this.messages = [
-      { role: 'system', content: this.buildSystemPrompt(voiceSettings) },
+      { role: 'system', content: this.buildSystemPrompt(voiceSettings, agentConfig) },
     ];
 
-    console.log(`[Stream] Started | user: ${this.userId} | provider: ${this.provider}`);
+    console.log(`[Stream] Started | user: ${this.userId} | provider: ${this.provider} | voice: ${this.voiceId}`);
 
     try {
       this.dgWs = await createLiveTranscription(
@@ -256,7 +262,7 @@ export class CallSession {
       const greetingText =
         voiceSettings.agent_greeting || 'Hello, thank you for calling. How can I help you?';
       console.log(`[Stream] Synthesizing greeting: "${greetingText}"`);
-      const greetingAudio = await synthesizeSpeech(this.env, greetingText);
+      const greetingAudio = await synthesizeSpeech(this.env, greetingText, this.voiceId);
       console.log('[Stream] Greeting audio received, sending to caller');
       this.sendAudioToCaller(greetingAudio);
       console.log('[Stream] Greeting sent');
@@ -298,7 +304,7 @@ export class CallSession {
         this.messages = [sys, ...this.messages.slice(-20)];
       }
 
-      const audioResponse = await synthesizeSpeech(this.env, aiText);
+      const audioResponse = await synthesizeSpeech(this.env, aiText, this.voiceId);
       this.sendAudioToCaller(audioResponse);
 
       console.log(`[Timing] Turn: ${Date.now() - turnStart}ms`);
@@ -309,7 +315,7 @@ export class CallSession {
     } catch (err) {
       console.error(`[Turn] Error after ${Date.now() - turnStart}ms:`, err.message, err.stack);
       try {
-        const fallback = await synthesizeSpeech(this.env, 'Sorry, could you repeat that?');
+        const fallback = await synthesizeSpeech(this.env, 'Sorry, could you repeat that?', this.voiceId);
         this.sendAudioToCaller(fallback);
       } catch {
         /* silent */
@@ -323,7 +329,7 @@ export class CallSession {
 
     if (remaining <= 0) {
       const closing = this.quotaExceededMessage || 'Your trial minutes are up for now.';
-      const audio = await synthesizeSpeech(this.env, closing);
+      const audio = await synthesizeSpeech(this.env, closing, this.voiceId);
       this.sendAudioToCaller(audio);
       await this.endCall();
       return;
@@ -332,7 +338,7 @@ export class CallSession {
     if (remaining <= 1 && !this.minuteWarningPlayed) {
       this.minuteWarningPlayed = true;
       const warning = 'Just a heads up, you have about one minute of trial time remaining.';
-      const audio = await synthesizeSpeech(this.env, warning);
+      const audio = await synthesizeSpeech(this.env, warning, this.voiceId);
       this.sendAudioToCaller(audio);
     }
   }
@@ -351,17 +357,47 @@ export class CallSession {
     );
   }
 
-  buildSystemPrompt(voiceSettings) {
-    return `You are an AI ${voiceSettings.agent_persona || 'receptionist'}.
+  buildSystemPrompt(voiceSettings, agentConfig) {
+    const cfg = agentConfig || {};
+    const orgName = cfg.organization_name || 'this business';
+    const nickname = cfg.agent_nickname ? ` named ${cfg.agent_nickname}` : '';
+    const position = cfg.agent_position || voiceSettings.agent_persona || 'receptionist';
 
-Rules — this is a phone call:
-- Maximum 2 sentences per response, no exceptions
-- No bullet points, lists, or markdown ever
-- Speak naturally and conversationally
-- For appointments: collect name, date, time, reason
-- If unsure, offer to take a message
+    const lines = [
+      `You are an AI ${position}${nickname} for ${orgName}.`,
+      '',
+      'Rules — this is a phone call:',
+      '- Maximum 2 sentences per response, no exceptions',
+      '- No bullet points, lists, or markdown ever',
+      '- Speak naturally and conversationally',
+      '- For appointments: collect name, date, time, reason',
+      '- If unsure, offer to take a message',
+    ];
 
-Today: ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}.`;
+    if (cfg.business_hours) lines.push(`- Business hours: ${cfg.business_hours}`);
+    if (cfg.business_location) lines.push(`- Location: ${cfg.business_location}`);
+    if (cfg.main_call_to_action) lines.push(`- Primary goal for callers: ${cfg.main_call_to_action}`);
+
+    // memory_context is the free-text business summary the client wrote or
+    // generated via the "scan my website" feature -- this is the actual
+    // fix for "the agent has no memory of the business it's answering for".
+    if (cfg.memory_context) {
+      lines.push('', 'What you know about this business (use naturally, do not read this list back verbatim):', cfg.memory_context);
+    }
+
+    if (cfg.negative_instructions) {
+      lines.push('', `Things to avoid: ${cfg.negative_instructions}`);
+    }
+
+    if (cfg.custom_system_prompt) {
+      // Client-authored instructions take precedence and are appended last
+      // so they can override the defaults above if they conflict.
+      lines.push('', cfg.custom_system_prompt);
+    }
+
+    lines.push('', `Today: ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}.`);
+
+    return lines.join('\n');
   }
 
   async onCallerClose() {

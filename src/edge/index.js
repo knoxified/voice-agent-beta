@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { mintVoiceAccessToken } from './services/twilioToken.js';
-import { getUserById, getUserByPhone, checkQuota } from './services/supabase.js';
+import { getUserById, getUserByPhone, checkQuota, logUnmatchedInboundCall } from './services/supabase.js';
 import { CallSession } from './durable_objects/CallSession.js';
 
 export { CallSession };
@@ -49,11 +49,12 @@ app.get('/test', async (c) => {
       method: 'POST',
       headers: {
         'X-API-Key': c.env.CARTESIA_API_KEY,
+        'Cartesia-Version': '2026-03-01',
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model_id: 'sonnet-1',
-        voice: { id: c.env.CARTESIA_VOICE_ID_DEFAULT || 'e07c00bc-4134-4eae-9ea4-1a55fb45746b' },
+        model_id: c.env.CARTESIA_MODEL_ID || 'sonic-3',
+        voice: { mode: 'id', id: c.env.CARTESIA_VOICE_ID_DEFAULT || 'e07c00bc-4134-4eae-9ea4-1a55fb45746b' },
         transcript: 'test',
       }),
     });
@@ -154,11 +155,18 @@ app.post('/voice/inbound', async (c) => {
 });
 
 async function handleTwilioInbound(c, body) {
-  const { CallSid, From, To } = body;
-  console.log(`[Twilio] Inbound call from ${From} to ${To} | SID: ${CallSid}`);
+  const { CallSid, From, To, ForwardedFrom } = body;
+  const lookupNumber = resolveDialedNumber({ to: To, forwardedFrom: ForwardedFrom });
+  console.log(`[Twilio] Inbound call from ${From} to ${To} (lookup: ${lookupNumber}) | SID: ${CallSid}`);
 
-  const user = await getUserByPhone(c.env, To);
+  const user = await getUserByPhone(c.env, lookupNumber);
   if (!user) {
+    // Shared-number call-forwarding setup: this fires whenever we can't
+    // tell which client's forwarded business number this call was
+    // originally dialed to. Logged so the real Twilio payload can be
+    // inspected (see phone_number_mappings / ForwardedFrom docs) rather
+    // than guessing further blind.
+    await logUnmatchedInboundCall(c.env, body, lookupNumber);
     return twimlResponse(sayAndHangup('This number is not currently in service. Goodbye.'));
   }
 
@@ -192,11 +200,24 @@ async function handleTelnyxInbound(c, body) {
     const callControlId = event.payload?.call_control_id;
     const toNumber = event.payload?.to;
     const fromNumber = event.payload?.from;
+    // Shared-number call-forwarding setup: when a client forwards their own
+    // business number to our one Telnyx number, `to` above is OUR number,
+    // not theirs -- it tells us nothing about which client this is. If the
+    // client's carrier passed SHAKEN/STIR diversion info through, Telnyx
+    // may expose it under one of these fields (not fully confirmed against
+    // a live payload yet -- see logUnmatchedInboundCall below).
+    const divertedNumber =
+      event.payload?.diversion?.diverting_number ||
+      event.payload?.custom_headers?.find?.((h) => /^diversion$/i.test(h.name))?.value ||
+      event.payload?.custom_headers?.find?.((h) => /^history-info$/i.test(h.name))?.value ||
+      null;
+    const lookupNumber = resolveDialedNumber({ to: toNumber, forwardedFrom: divertedNumber });
 
-    console.log(`[Telnyx] Inbound call from ${fromNumber} to ${toNumber}`);
+    console.log(`[Telnyx] Inbound call from ${fromNumber} to ${toNumber} (lookup: ${lookupNumber})`);
 
-    const user = await getUserByPhone(c.env, toNumber);
+    const user = await getUserByPhone(c.env, lookupNumber);
     if (!user) {
+      await logUnmatchedInboundCall(c.env, event, lookupNumber);
       return c.json({
         commands: [{ command: 'speak', params: { payload: 'This number is not currently in service. Goodbye.', voice: 'en-US-Neural2-F', language: 'en-US' } }],
       });
@@ -246,6 +267,15 @@ app.get('/voice/stream/:callId', async (c) => {
   const stub = c.env.CALL_SESSION.get(id);
   return stub.fetch(c.req.raw);
 });
+
+// Prefer the originally-dialed number a carrier passed through on a
+// forwarded call (ForwardedFrom on Twilio, diversion info on Telnyx) over
+// the raw `to`, since with one shared number `to` is always OUR number
+// and can't tell clients apart. Falls back to `to` unchanged for clients
+// who still have their own dedicated number.
+function resolveDialedNumber({ to, forwardedFrom }) {
+  return forwardedFrom || to;
+}
 
 function sayAndHangup(text) {
   return `<?xml version="1.0" encoding="UTF-8"?>

@@ -210,10 +210,50 @@ async function saveCallTranscript(env, userId, callId, callerNumber, provider, d
   }
 }
 
+async function getAgentConfig(env, userId) {
+  const supabase = db(env);
+  try {
+    const { data, error } = await supabase
+      .from('agent_configs')
+      .select(
+        'organization_name, agent_nickname, agent_position, business_hours, business_location, main_call_to_action, custom_system_prompt, memory_context, negative_instructions'
+      )
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (error || !data) return null;
+    return data;
+  } catch (err) {
+    console.error('[Supabase] getAgentConfig error:', err.message);
+    return null;
+  }
+}
+
+// Best-effort diagnostic trail for inbound calls that couldn't be matched
+// to a client -- e.g. the shared-number call-forwarding setup, where the
+// carrier didn't pass through (or we didn't correctly parse) diversion
+// info showing which client's number was actually dialed. Written to the
+// existing audit_logs table so the raw payload can be inspected later
+// instead of guessing blind at which SIP header a given carrier used.
+async function logUnmatchedInboundCall(env, rawPayload, resolvedToNumber) {
+  const supabase = db(env);
+  try {
+    await supabase.from('audit_logs').insert({
+      action: 'voice_inbound_unmatched',
+      entity_type: 'phone_number',
+      metadata: { resolved_to_number: resolvedToNumber || null, raw: rawPayload },
+    });
+  } catch (err) {
+    console.error('[Supabase] logUnmatchedInboundCall error:', err.message);
+  }
+}
+
 export {
   getUserByPhone,
   getUserById,
   getUserVoiceSettings,
+  getAgentConfig,
+  logUnmatchedInboundCall,
   checkQuota,
   getRemainingMinutes,
   deductMinutes,
