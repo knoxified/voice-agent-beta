@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { mintVoiceAccessToken } from './services/twilioToken.js';
+import { telnyxAnswer, telnyxSpeak, telnyxHangup, telnyxStreamingStart } from './services/telnyx.js';
 import { getUserById, getUserByPhone, checkQuota, logUnmatchedInboundCall } from './services/supabase.js';
 import { CallSession } from './durable_objects/CallSession.js';
 
@@ -218,21 +219,29 @@ async function handleTelnyxInbound(c, body) {
     const user = await getUserByPhone(c.env, lookupNumber);
     if (!user) {
       await logUnmatchedInboundCall(c.env, event, lookupNumber);
-      return c.json({
-        commands: [{ command: 'speak', params: { payload: 'This number is not currently in service. Goodbye.', voice: 'en-US-Neural2-F', language: 'en-US' } }],
-      });
+      // Must answer before we can speak -- Telnyx won't play audio on an
+      // unanswered call.
+      await telnyxAnswer(c.env, callControlId);
+      await telnyxSpeak(c.env, callControlId, 'This number is not currently in service. Goodbye.');
+      await telnyxHangup(c.env, callControlId);
+      return c.text('', 200);
     }
 
     const quotaOk = await checkQuota(c.env, user.id);
     if (!quotaOk) {
-      return c.json({
-        commands: [{ command: 'speak', params: { payload: 'Sorry, your minutes have been exhausted. Please upgrade your plan.', voice: 'en-US-Neural2-F', language: 'en-US' } }],
-      });
+      await telnyxAnswer(c.env, callControlId);
+      await telnyxSpeak(c.env, callControlId, 'Sorry, your minutes have been exhausted. Please upgrade your plan.');
+      await telnyxHangup(c.env, callControlId);
+      return c.text('', 200);
     }
 
-    return c.json({
-      commands: [{ command: 'answer', params: {}, client_state: btoa(JSON.stringify({ userId: user.id, callerNumber: fromNumber })) }],
+    // client_state rides along on every future webhook for this call
+    // (Telnyx echoes it back), so call.answered below can recover which
+    // user/caller this is without a second DB lookup.
+    await telnyxAnswer(c.env, callControlId, {
+      client_state: btoa(JSON.stringify({ userId: user.id, callerNumber: fromNumber })),
     });
+    return c.text('', 200);
   }
 
   if (eventType === 'call.answered') {
@@ -253,9 +262,14 @@ async function handleTelnyxInbound(c, body) {
       `wss://${host}/voice/stream/${callControlId}` +
       `?userId=${encodeURIComponent(userId)}&callerNumber=${encodeURIComponent(callerNumber)}&provider=telnyx`;
 
-    return c.json({
-      commands: [{ command: 'streaming_start', params: { stream_url: streamUrl, stream_track: 'both_tracks' } }],
-    });
+    const result = await telnyxStreamingStart(c.env, callControlId, streamUrl);
+    if (!result.ok) {
+      // We already answered the call -- if streaming fails to start the
+      // caller would otherwise sit in silence forever, so hang up cleanly
+      // instead of leaving a dead-air call running up minutes.
+      await telnyxHangup(c.env, callControlId).catch(() => {});
+    }
+    return c.text('', 200);
   }
 
   return c.text('', 200);
