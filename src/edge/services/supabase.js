@@ -123,7 +123,7 @@ async function checkQuota(env, userId) {
   try {
     const { data: userData, error: userError } = await supabase
       .from('users')
-      .select('plans ( limit_voice_minutes )')
+      .select('credits_locked, plans ( limit_voice_minutes )')
       .eq('id', userId)
       .single();
 
@@ -131,6 +131,12 @@ async function checkQuota(env, userId) {
       console.error('[Supabase] checkQuota user fetch error:', userError?.message);
       return false; // Fail closed
     }
+
+    // Duplicate-account abuse lock: view/navigate the dashboard is still
+    // allowed, but nothing that spends minutes or credits. Clears
+    // automatically once the account upgrades to a paid plan (see the
+    // Flutterwave webhook).
+    if (userData.credits_locked) return false;
 
     const limitMinutes = userData.plans?.limit_voice_minutes || 0;
     if (limitMinutes === 0) return true; // 0 = unlimited
