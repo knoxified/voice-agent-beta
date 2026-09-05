@@ -216,6 +216,30 @@ async function saveCallTranscript(env, userId, callId, callerNumber, provider, d
   }
 }
 
+// Industry-specific language for whichever systems (verticals) this user
+// has activated -- e.g. a plumbing company's agent should talk about
+// emergency triage and dispatch, not generic receptionist filler. Each
+// system's industry_prompt is authored to match the real language used on
+// the marketing site for that vertical (see systems_catalog).
+async function getEnabledSystemPrompts(env, userId) {
+  const supabase = db(env);
+  try {
+    const { data, error } = await supabase
+      .from('user_systems')
+      .select('systems_catalog ( name, industry_prompt )')
+      .eq('user_id', userId)
+      .eq('is_enabled', true);
+
+    if (error || !data) return [];
+    return data
+      .map((row) => row.systems_catalog?.industry_prompt)
+      .filter((p) => typeof p === 'string' && p.trim().length > 0);
+  } catch (err) {
+    console.error('[Supabase] getEnabledSystemPrompts error:', err.message);
+    return [];
+  }
+}
+
 async function getAgentConfig(env, userId) {
   const supabase = db(env);
   try {
@@ -259,6 +283,7 @@ export {
   getUserById,
   getUserVoiceSettings,
   getAgentConfig,
+  getEnabledSystemPrompts,
   logUnmatchedInboundCall,
   checkQuota,
   getRemainingMinutes,

@@ -7,6 +7,7 @@ import {
   getUserById,
   getUserVoiceSettings,
   getAgentConfig,
+  getEnabledSystemPrompts,
   getRemainingMinutes,
   deductMinutes,
   saveCallTranscript,
@@ -217,9 +218,10 @@ export class CallSession {
     this.isTrial = user?.isTrial || false;
     console.log(`[Stream] User loaded | isTrial: ${this.isTrial}`);
 
-    const [voiceSettings, agentConfig] = await Promise.all([
+    const [voiceSettings, agentConfig, systemPrompts] = await Promise.all([
       getUserVoiceSettings(this.env, this.userId),
       getAgentConfig(this.env, this.userId),
+      getEnabledSystemPrompts(this.env, this.userId),
     ]);
     this.quotaExceededMessage = voiceSettings.quota_exceeded_message;
     this.voiceId = voiceSettings.preferred_voice_id;
@@ -227,7 +229,7 @@ export class CallSession {
     this.remainingMinutesAtStart = await getRemainingMinutes(this.env, this.userId);
 
     this.messages = [
-      { role: 'system', content: this.buildSystemPrompt(voiceSettings, agentConfig) },
+      { role: 'system', content: this.buildSystemPrompt(voiceSettings, agentConfig, systemPrompts) },
     ];
 
     console.log(`[Stream] Started | user: ${this.userId} | provider: ${this.provider} | voice: ${this.voiceId}`);
@@ -357,7 +359,7 @@ export class CallSession {
     );
   }
 
-  buildSystemPrompt(voiceSettings, agentConfig) {
+  buildSystemPrompt(voiceSettings, agentConfig, systemPrompts) {
     const cfg = agentConfig || {};
     const orgName = cfg.organization_name || 'this business';
     const nickname = cfg.agent_nickname ? ` named ${cfg.agent_nickname}` : '';
@@ -383,6 +385,14 @@ export class CallSession {
     // fix for "the agent has no memory of the business it's answering for".
     if (cfg.memory_context) {
       lines.push('', 'What you know about this business (use naturally, do not read this list back verbatim):', cfg.memory_context);
+    }
+
+    // Industry-specific tone/vocabulary from whichever Systems (verticals)
+    // the client has activated -- e.g. plumbing calls talk about triage and
+    // dispatch, dental calls stay reassuring and never give clinical advice.
+    if (systemPrompts && systemPrompts.length > 0) {
+      lines.push('', 'Industry context for this business:');
+      for (const p of systemPrompts) lines.push(p);
     }
 
     if (cfg.negative_instructions) {
