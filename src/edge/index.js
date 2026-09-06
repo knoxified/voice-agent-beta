@@ -2,7 +2,10 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { mintVoiceAccessToken } from './services/twilioToken.js';
 import { telnyxAnswer, telnyxSpeak, telnyxHangup, telnyxStreamingStart } from './services/telnyx.js';
-import { getUserById, getUserByPhone, checkQuota, logUnmatchedInboundCall } from './services/supabase.js';
+import { getUserById, getUserByPhone, checkQuota, logUnmatchedInboundCall, getUserVoiceSettings, getAgentConfig } from './services/supabase.js';
+import { synthesizeSpeech } from './services/tts.js';
+import { buildGreeting } from './services/greeting.js';
+import { createClient } from '@supabase/supabase-js';
 import { CallSession } from './durable_objects/CallSession.js';
 
 export { CallSession };
@@ -93,6 +96,40 @@ app.post('/voice/token', async (c) => {
 
   const token = await mintVoiceAccessToken(c.env, userId);
   return c.json({ token });
+});
+
+// Lets a client hear their actual configured agent (voice, name, company)
+// before ever touching a phone number -- a cold prospect's first real
+// question is "does this sound competent," and until now there was no way
+// to answer that without going through the full phone-forwarding setup.
+// Auth is a verified Supabase JWT (not a client-supplied user id) so this
+// can't be used to generate free TTS against someone else's account.
+app.post('/voice/preview', async (c) => {
+  const authHeader = c.req.header('authorization') || '';
+  const token = authHeader.replace(/^Bearer\s+/i, '');
+  if (!token) return c.json({ error: 'not_authenticated' }, 401);
+
+  const verifyClient = createClient(c.env.SUPABASE_URL, c.env.SUPABASE_SERVICE_ROLE_KEY);
+  const { data: { user }, error: authError } = await verifyClient.auth.getUser(token);
+  if (authError || !user) return c.json({ error: 'not_authenticated' }, 401);
+
+  const [voiceSettings, agentConfig] = await Promise.all([
+    getUserVoiceSettings(c.env, user.id),
+    getAgentConfig(c.env, user.id),
+  ]);
+
+  const previewText = buildGreeting(agentConfig, voiceSettings?.agent_greeting);
+
+  try {
+    const audio = await synthesizeSpeech(c.env, previewText, voiceSettings?.preferred_voice_id, 'mp3');
+    if (!audio) return c.json({ error: 'synthesis_failed' }, 500);
+    return new Response(audio, {
+      headers: { 'Content-Type': 'audio/mpeg', 'Cache-Control': 'no-store' },
+    });
+  } catch (err) {
+    console.error('[voice/preview] error:', err.message);
+    return c.json({ error: 'synthesis_failed' }, 500);
+  }
 });
 
 app.post('/voice/web-call/start', async (c) => {

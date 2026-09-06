@@ -12,6 +12,7 @@ import {
   deductMinutes,
   saveCallTranscript,
 } from '../services/supabase.js';
+import { buildGreeting } from '../services/greeting.js';
 
 export class CallSession {
   constructor(state, env) {
@@ -225,6 +226,8 @@ export class CallSession {
     ]);
     this.quotaExceededMessage = voiceSettings.quota_exceeded_message;
     this.voiceId = voiceSettings.preferred_voice_id;
+    this.agentConfig = agentConfig || {};
+    this.voiceSettingsGreeting = voiceSettings.agent_greeting;
 
     this.remainingMinutesAtStart = await getRemainingMinutes(this.env, this.userId);
 
@@ -261,8 +264,7 @@ export class CallSession {
     }
 
     try {
-      const greetingText =
-        voiceSettings.agent_greeting || 'Hello, thank you for calling. How can I help you?';
+      const greetingText = buildGreeting(this.agentConfig, this.voiceSettingsGreeting);
       console.log(`[Stream] Synthesizing greeting: "${greetingText}"`);
       const greetingAudio = await synthesizeSpeech(this.env, greetingText, this.voiceId);
       console.log('[Stream] Greeting audio received, sending to caller');

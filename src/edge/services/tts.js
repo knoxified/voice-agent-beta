@@ -2,16 +2,24 @@
 // axios nor Buffer are reliable in the Workers runtime; fetch and
 // ArrayBuffer/Uint8Array are native Web APIs Workers is built around.
 
-async function synthesizeSpeech(env, text, voiceId) {
+async function synthesizeSpeech(env, text, voiceId, outputFormat = 'call') {
   if (!text || text.trim().length === 0) return null;
   const provider = env.TTS_PROVIDER || 'cartesia';
-  if (provider === 'cartesia') return synthesizeCartesia(env, text, voiceId);
+  if (provider === 'cartesia') return synthesizeCartesia(env, text, voiceId, outputFormat);
   return synthesizeTelnyx(env, text, voiceId);
 }
 
-async function synthesizeCartesia(env, text, voiceId) {
+async function synthesizeCartesia(env, text, voiceId, outputFormat = 'call') {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8000); // 8s max
+
+  // 'call' = raw mu-law 8kHz for the live Twilio/Telnyx audio path (unchanged
+  // from before). 'mp3' = a normal, browser-playable file -- used by the
+  // /voice/preview endpoint, never by an in-progress call.
+  const format =
+    outputFormat === 'mp3'
+      ? { container: 'mp3', bit_rate: 64000, sample_rate: 44100 }
+      : { container: 'raw', encoding: 'pcm_mulaw', sample_rate: 8000 };
 
   try {
     const res = await fetch('https://api.cartesia.ai/tts/bytes', {
@@ -35,11 +43,7 @@ async function synthesizeCartesia(env, text, voiceId) {
           // hardcoded default voice.
           id: voiceId || env.CARTESIA_VOICE_ID_DEFAULT || env.CARTESIA_VOICE_ID || 'e07c00bc-4134-4eae-9ea4-1a55fb45746b',
         },
-        output_format: {
-          container: 'raw',
-          encoding: 'pcm_mulaw', // Twilio/Telnyx expect mulaw 8kHz
-          sample_rate: 8000,
-        },
+        output_format: format,
         language: 'en',
       }),
       signal: controller.signal,
