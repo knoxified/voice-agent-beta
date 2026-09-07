@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { mintVoiceAccessToken } from './services/twilioToken.js';
 import { telnyxAnswer, telnyxSpeak, telnyxHangup, telnyxStreamingStart } from './services/telnyx.js';
-import { getUserById, getUserByPhone, checkQuota, logUnmatchedInboundCall, getUserVoiceSettings, getAgentConfig } from './services/supabase.js';
+import { getUserById, getUserByPhone, checkQuota, logUnmatchedInboundCall, getUserVoiceSettings, getAgentConfig, saveCallRecordingUrl } from './services/supabase.js';
 import { synthesizeSpeech } from './services/tts.js';
 import { buildGreeting } from './services/greeting.js';
 import { createClient } from '@supabase/supabase-js';
@@ -192,6 +192,27 @@ app.post('/voice/inbound', async (c) => {
   return c.text('', 400);
 });
 
+// Twilio calls this once a started recording finishes processing --
+// recording completion happens well after the call itself ends, so this
+// almost always arrives after saveCallTranscript already created the row
+// (see the upsert-safe write pattern in supabase.js).
+app.post('/voice/recording-status', async (c) => {
+  const body = await parseInboundBody(c.req);
+  const callSid = body.CallSid;
+  const recordingUrl = body.RecordingUrl;
+  const status = body.RecordingStatus;
+
+  if (status === 'completed' && callSid && recordingUrl) {
+    // Twilio's RecordingUrl needs ".mp3" appended to fetch the actual audio
+    // file (the bare URL returns recording metadata, not audio).
+    await saveCallRecordingUrl(c.env, callSid, `${recordingUrl}.mp3`);
+  } else {
+    console.log(`[Twilio] Recording status '${status}' for ${callSid} -- not storing`);
+  }
+
+  return c.text('', 200);
+});
+
 async function handleTwilioInbound(c, body) {
   const { CallSid, From, To, ForwardedFrom } = body;
   const lookupNumber = resolveDialedNumber({ to: To, forwardedFrom: ForwardedFrom });
@@ -211,6 +232,17 @@ async function handleTwilioInbound(c, body) {
   const quotaOk = await checkQuota(c.env, user.id);
   if (!quotaOk) {
     return twimlResponse(sayAndHangup('Sorry, your minutes have been exhausted. Please upgrade your plan.'));
+  }
+
+  const agentConfig = await getAgentConfig(c.env, user.id);
+  if (agentConfig?.call_recording_enabled) {
+    const host = new URL(c.req.url).host;
+    const statusCallbackUrl = `https://${host}/voice/recording-status`;
+    // Fired in the background -- Twilio's Call Recording Controls API works
+    // concurrently with an active <Connect><Stream> call (confirmed via
+    // Twilio's own docs), so this doesn't block or interfere with the TwiML
+    // response below.
+    c.executionCtx.waitUntil(startTwilioRecording(c.env, CallSid, statusCallbackUrl));
   }
 
   const host = new URL(c.req.url).host;
@@ -324,6 +356,47 @@ app.get('/voice/stream/:callId', async (c) => {
 // the raw `to`, since with one shared number `to` is always OUR number
 // and can't tell clients apart. Falls back to `to` unchanged for clients
 // who still have their own dedicated number.
+// Twilio's Call Recording Controls API -- starts recording an already-
+// in-progress call via a separate REST call, independent of the
+// <Connect><Stream> TwiML already driving the live AI conversation.
+// Confirmed via Twilio's own docs this works concurrently with Media
+// Streams (no <Dial>/<Record> verb needed). Uses the same API Key/Secret
+// already configured for minting Voice SDK tokens (twilioToken.js) --
+// Twilio accepts API Key SID/Secret as Basic Auth credentials for the
+// REST API, scoped the same as the main Account SID.
+async function startTwilioRecording(env, callSid, statusCallbackUrl) {
+  if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_API_KEY || !env.TWILIO_API_SECRET) {
+    console.error('[Twilio] Missing credentials -- cannot start recording.');
+    return;
+  }
+  try {
+    const auth = btoa(`${env.TWILIO_API_KEY}:${env.TWILIO_API_SECRET}`);
+    const body = new URLSearchParams({
+      RecordingStatusCallback: statusCallbackUrl,
+      RecordingStatusCallbackEvent: 'completed',
+    });
+    const res = await fetch(
+      `https://api.twilio.com/2010-04-01/Accounts/${env.TWILIO_ACCOUNT_SID}/Calls/${callSid}/Recordings.json`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Basic ${auth}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: body.toString(),
+      }
+    );
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      console.error(`[Twilio] startRecording failed (${res.status}) for ${callSid}: ${errText}`);
+    } else {
+      console.log(`[Twilio] Recording started for call ${callSid}`);
+    }
+  } catch (err) {
+    console.error('[Twilio] startRecording error:', err.message);
+  }
+}
+
 function resolveDialedNumber({ to, forwardedFrom }) {
   return forwardedFrom || to;
 }

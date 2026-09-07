@@ -197,14 +197,23 @@ async function deductMinutes(env, userId, minutesUsed, sessionId) {
 async function saveCallTranscript(env, userId, callId, callerNumber, provider, durationSecs, messages) {
   const supabase = db(env);
   try {
-    const { error } = await supabase.from('call_transcripts').insert({
-      user_id: userId,
-      call_id: callId,
-      caller_number: callerNumber || null,
-      provider: provider || null,
-      duration_secs: durationSecs || 0,
-      messages: (messages || []).filter((m) => m.role !== 'system'),
-    });
+    // Upsert, not insert: the Twilio recording-status webhook may arrive
+    // before or after this (recording processing time varies), and both
+    // write to the same row keyed by call_id. Neither should clobber the
+    // other's columns -- Supabase's upsert only touches the columns it's
+    // given, so omitting recording_url here leaves it as-is if the webhook
+    // already set it.
+    const { error } = await supabase.from('call_transcripts').upsert(
+      {
+        user_id: userId,
+        call_id: callId,
+        caller_number: callerNumber || null,
+        provider: provider || null,
+        duration_secs: durationSecs || 0,
+        messages: (messages || []).filter((m) => m.role !== 'system'),
+      },
+      { onConflict: 'call_id' }
+    );
 
     if (error) {
       console.error('[Supabase] saveCallTranscript error:', error.message);
@@ -213,6 +222,32 @@ async function saveCallTranscript(env, userId, callId, callerNumber, provider, d
     }
   } catch (err) {
     console.error('[Supabase] saveCallTranscript exception:', err.message);
+  }
+}
+
+// Stashes the recording URL Twilio's recording-status callback gives us,
+// keyed by call_id -- may arrive before or after saveCallTranscript above,
+// handled the same upsert-safe way.
+async function saveCallRecordingUrl(env, callId, recordingUrl) {
+  const supabase = db(env);
+  try {
+    const { data, error } = await supabase
+      .from('call_transcripts')
+      .update({ recording_url: recordingUrl })
+      .eq('call_id', callId)
+      .select('id');
+    if (error) {
+      console.error('[Supabase] saveCallRecordingUrl error:', error.message);
+    } else if (!data || data.length === 0) {
+      // Recording finished processing before the transcript row existed --
+      // rare (saveCallTranscript fires right at hangup, recording
+      // processing takes longer), but if it happens the recording_url is
+      // lost for this call rather than risk a NOT NULL violation on a
+      // stub insert with no user_id.
+      console.warn(`[Supabase] No call_transcripts row yet for call ${callId} -- recording_url not attached`);
+    }
+  } catch (err) {
+    console.error('[Supabase] saveCallRecordingUrl exception:', err.message);
   }
 }
 
@@ -246,7 +281,7 @@ async function getAgentConfig(env, userId) {
     const { data, error } = await supabase
       .from('agent_configs')
       .select(
-        'organization_name, agent_nickname, agent_position, business_hours, business_location, main_call_to_action, custom_system_prompt, memory_context, negative_instructions'
+        'organization_name, agent_nickname, agent_position, business_hours, business_location, main_call_to_action, custom_system_prompt, memory_context, negative_instructions, call_recording_enabled'
       )
       .eq('user_id', userId)
       .maybeSingle();
@@ -289,4 +324,5 @@ export {
   getRemainingMinutes,
   deductMinutes,
   saveCallTranscript,
+  saveCallRecordingUrl,
 };
