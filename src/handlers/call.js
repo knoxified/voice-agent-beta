@@ -55,14 +55,14 @@ async function handleTelnyxInbound(req, res, body) {
     }
 
     // Step 2: Check quota
-    const quotaOk = await checkQuota(user.id);
-    if (!quotaOk) {
+    const quota = await checkQuota(user.id);
+    if (!quota.ok) {
       console.log(`[Telnyx] User ${user.id} has no minutes remaining`);
       return res.json({
         commands: [{
           command: 'speak',
           params: {
-            payload: 'Sorry, your minutes have been exhausted. Please upgrade your plan.',
+            payload: quota.message,
             voice: 'en-US-Neural2-F',
             language: 'en-US'
           }
@@ -142,11 +142,11 @@ async function handleTwilioInbound(req, res, body) {
   }
 
   // Step 2: Check quota
-  const quotaOk = await checkQuota(user.id);
-  if (!quotaOk) {
+  const quota = await checkQuota(user.id);
+  if (!quota.ok) {
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Amy">Sorry, your minutes have been exhausted. Please upgrade your plan.</Say>
+  <Say voice="Polly.Amy">${quota.message}</Say>
   <Hangup/>
 </Response>`;
     res.type('text/xml');

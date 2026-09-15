@@ -120,12 +120,14 @@ async function getUserVoiceSettings(userId) {
 // Supabase JS client doesn't support SQL aggregates in .select()
 // so we fetch rows for the current month and sum in JS
 async function checkQuota(userId) {
+  const GENERIC_MESSAGE = 'Sorry, your minutes have been exhausted. Please upgrade your plan.';
   try {
     const { data: userData, error: userError } = await supabase
       .from('users')
       .select(`
         plans (
-          limit_voice_minutes
+          limit_voice_minutes,
+          price
         )
       `)
       .eq('id', userId)
@@ -134,13 +136,13 @@ async function checkQuota(userId) {
     if (userError || !userData) {
       console.error('[Supabase] checkQuota user fetch error:', userError?.message);
       // Fail closed in production — don't grant minutes if we can't verify
-      return process.env.NODE_ENV === 'development';
+      return { ok: process.env.NODE_ENV === 'development', message: GENERIC_MESSAGE };
     }
 
     const limitMinutes = userData.plans?.limit_voice_minutes || 0;
 
     // 0 = unlimited (enterprise/custom plans)
-    if (limitMinutes === 0) return true;
+    if (limitMinutes === 0) return { ok: true, message: null };
 
     // Get this month's usage rows
     const startOfMonth = new Date();
@@ -156,7 +158,7 @@ async function checkQuota(userId) {
     if (usageError) {
       console.error('[Supabase] checkQuota usage fetch error:', usageError.message);
       // Fail closed — don't grant on DB error in production
-      return process.env.NODE_ENV === 'development';
+      return { ok: process.env.NODE_ENV === 'development', message: GENERIC_MESSAGE };
     }
 
     // Sum in JS — avoids Supabase aggregate limitation
@@ -167,11 +169,22 @@ async function checkQuota(userId) {
 
     console.log(`[Quota] User ${userId}: ${usedMinutes}/${limitMinutes} min used, ${remaining} remaining`);
 
-    return remaining > 0;
+    if (remaining > 0) return { ok: true, message: null };
+
+    // Real fix: a Pro/Starter/Enterprise customer hitting their configured
+    // minute cap was hearing "please upgrade to a paid plan" -- nonsensical
+    // when they're already paying. plans.price > 0 is a reliable paid/trial
+    // signal here (real pricing data already in this table), safer than
+    // matching an exact plan name string that could drift out of sync.
+    const isPaidPlan = (userData.plans?.price || 0) > 0;
+    const message = isPaidPlan
+      ? "You've used all your voice minutes for this billing cycle. They'll refresh at the start of your next cycle, or you can upgrade to a higher plan for more capacity."
+      : GENERIC_MESSAGE;
+    return { ok: false, message };
 
   } catch (err) {
     console.error('[Supabase] checkQuota exception:', err.message);
-    return process.env.NODE_ENV === 'development';
+    return { ok: process.env.NODE_ENV === 'development', message: GENERIC_MESSAGE };
   }
 }
 

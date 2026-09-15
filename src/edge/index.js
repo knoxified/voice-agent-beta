@@ -89,9 +89,9 @@ app.post('/voice/token', async (c) => {
   const user = await getUserById(c.env, userId);
   if (!user) return c.json({ error: 'user_not_found' }, 404);
 
-  const quotaOk = await checkQuota(c.env, userId);
-  if (!quotaOk) {
-    return c.json({ error: 'quota_exceeded' }, 402);
+  const quota = await checkQuota(c.env, userId);
+  if (!quota.ok) {
+    return c.json({ error: 'quota_exceeded', message: quota.message }, 402);
   }
 
   const token = await mintVoiceAccessToken(c.env, userId);
@@ -139,8 +139,8 @@ app.post('/voice/web-call/start', async (c) => {
   const user = await getUserById(c.env, userId);
   if (!user) return c.json({ error: 'user_not_found' }, 404);
 
-  const quotaOk = await checkQuota(c.env, userId);
-  if (!quotaOk) return c.json({ error: 'quota_exceeded' }, 402);
+  const quota = await checkQuota(c.env, userId);
+  if (!quota.ok) return c.json({ error: 'quota_exceeded', message: quota.message }, 402);
 
   return c.json({ ready: true });
 });
@@ -160,9 +160,9 @@ app.post('/twiml/web-call', async (c) => {
     return twimlResponse(sayAndHangup('Account not found. Goodbye.'));
   }
 
-  const quotaOk = await checkQuota(c.env, userId);
-  if (!quotaOk) {
-    return twimlResponse(sayAndHangup('Sorry, your minutes have been exhausted. Please upgrade your plan.'));
+  const quota = await checkQuota(c.env, userId);
+  if (!quota.ok) {
+    return twimlResponse(sayAndHangup(quota.message));
   }
 
   const host = new URL(c.req.url).host;
@@ -229,9 +229,9 @@ async function handleTwilioInbound(c, body) {
     return twimlResponse(sayAndHangup('This number is not currently in service. Goodbye.'));
   }
 
-  const quotaOk = await checkQuota(c.env, user.id);
-  if (!quotaOk) {
-    return twimlResponse(sayAndHangup('Sorry, your minutes have been exhausted. Please upgrade your plan.'));
+  const quota = await checkQuota(c.env, user.id);
+  if (!quota.ok) {
+    return twimlResponse(sayAndHangup(quota.message));
   }
 
   const agentConfig = await getAgentConfig(c.env, user.id);
@@ -296,10 +296,10 @@ async function handleTelnyxInbound(c, body) {
       return c.text('', 200);
     }
 
-    const quotaOk = await checkQuota(c.env, user.id);
-    if (!quotaOk) {
+    const quota = await checkQuota(c.env, user.id);
+    if (!quota.ok) {
       await telnyxAnswer(c.env, callControlId);
-      await telnyxSpeak(c.env, callControlId, 'Sorry, your minutes have been exhausted. Please upgrade your plan.');
+      await telnyxSpeak(c.env, callControlId, quota.message);
       await telnyxHangup(c.env, callControlId);
       return c.text('', 200);
     }

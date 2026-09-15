@@ -120,34 +120,47 @@ async function getUsedMinutesThisMonth(supabase, userId) {
 
 async function checkQuota(env, userId) {
   const supabase = db(env);
+  const GENERIC_MESSAGE = 'Sorry, your minutes have been exhausted. Please upgrade your plan.';
   try {
     const { data: userData, error: userError } = await supabase
       .from('users')
-      .select('credits_locked, plans ( limit_voice_minutes )')
+      .select('credits_locked, plans ( limit_voice_minutes, price )')
       .eq('id', userId)
       .single();
 
     if (userError || !userData) {
       console.error('[Supabase] checkQuota user fetch error:', userError?.message);
-      return false; // Fail closed
+      return { ok: false, message: GENERIC_MESSAGE }; // Fail closed
     }
 
     // Duplicate-account abuse lock: view/navigate the dashboard is still
     // allowed, but nothing that spends minutes or credits. Clears
     // automatically once the account upgrades to a paid plan (see the
-    // Flutterwave webhook).
-    if (userData.credits_locked) return false;
+    // Flutterwave webhook), so the generic message is still accurate here
+    // even on a paid plan in the rare case a paid account gets flagged.
+    if (userData.credits_locked) return { ok: false, message: GENERIC_MESSAGE };
 
     const limitMinutes = userData.plans?.limit_voice_minutes || 0;
-    if (limitMinutes === 0) return true; // 0 = unlimited
+    if (limitMinutes === 0) return { ok: true, message: null }; // 0 = unlimited
 
     const used = await getUsedMinutesThisMonth(supabase, userId);
-    if (used === null) return false; // Fail closed on DB error
+    if (used === null) return { ok: false, message: GENERIC_MESSAGE }; // Fail closed on DB error
 
-    return used < limitMinutes;
+    if (used < limitMinutes) return { ok: true, message: null };
+
+    // Real fix: a Pro/Starter/Enterprise customer hitting their configured
+    // minute cap was hearing "please upgrade to a paid plan" -- nonsensical
+    // when they're already paying. plans.price > 0 is a reliable paid/trial
+    // signal here (real pricing data already in this table), safer than
+    // matching an exact plan name string that could drift out of sync.
+    const isPaidPlan = (userData.plans?.price || 0) > 0;
+    const message = isPaidPlan
+      ? "You've used all your voice minutes for this billing cycle. They'll refresh at the start of your next cycle, or you can upgrade to a higher plan for more capacity."
+      : GENERIC_MESSAGE;
+    return { ok: false, message };
   } catch (err) {
     console.error('[Supabase] checkQuota error:', err.message);
-    return false;
+    return { ok: false, message: GENERIC_MESSAGE };
   }
 }
 

@@ -93,11 +93,19 @@ async function browserInboundHandler(req, res) {
       .single();
 
     // Load plan limits
-    const { data: userData } = await supabase
+    const { data: userData, error: planError } = await supabase
       .from('users')
-      .select('plan_id, plans(limit_voice_minutes, name)')
+      .select('plan_id, plans(limit_voice_minutes, price)')
       .eq('id', userId)
       .single();
+
+    // The 5-minute fallback below only exists for a genuinely missing plan
+    // join -- log it loudly rather than let it fail silently, since a
+    // paid-plan customer accidentally landing on a 5-minute cap due to a
+    // broken join looked exactly like this bug from the outside.
+    if (planError || !userData?.plans) {
+      console.error('[Browser] Could not resolve plan for user', userId, planError?.message);
+    }
 
     // Check voice minutes remaining
     const { data: usageData } = await supabase
@@ -109,8 +117,15 @@ async function browserInboundHandler(req, res) {
     const minuteLimit = userData?.plans?.limit_voice_minutes || 5;
 
     if (totalUsed >= minuteLimit) {
-      const msg = voiceSettings?.quota_exceeded_message ||
-        'Sorry, your voice minutes have been exhausted. Please upgrade your plan.';
+      // Real fix: a Pro/Starter/Enterprise customer hitting their minute
+      // cap was hearing "please upgrade to a paid plan" -- nonsensical
+      // when they're already paying. plans.price > 0 is a reliable
+      // paid/trial signal here, safer than matching a plan name string.
+      const isPaidPlan = (userData?.plans?.price || 0) > 0;
+      const msg = isPaidPlan
+        ? "You've used all your voice minutes for this billing cycle. They'll refresh at the start of your next cycle, or you can upgrade to a higher plan for more capacity."
+        : (voiceSettings?.quota_exceeded_message ||
+          'Sorry, your voice minutes have been exhausted. Please upgrade your plan.');
       const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say>${msg}</Say>
