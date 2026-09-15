@@ -1,6 +1,7 @@
 require('dotenv').config();
 const twilio = require('twilio');
 const { createClient } = require('@supabase/supabase-js');
+const { buildGreeting } = require('../services/greeting');
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -92,6 +93,16 @@ async function browserInboundHandler(req, res) {
       .eq('user_id', userId)
       .single();
 
+    // Load the agent's actual configured identity -- this was missing
+    // entirely before, which is why {{company}}/{{agent}} placeholders in
+    // a custom greeting had nothing to substitute with and got spoken
+    // literally on real calls.
+    const { data: agentConfig } = await supabase
+      .from('agent_configs')
+      .select('agent_nickname, organization_name')
+      .eq('user_id', userId)
+      .single();
+
     // Load plan limits
     const { data: userData, error: planError } = await supabase
       .from('users')
@@ -145,8 +156,10 @@ async function browserInboundHandler(req, res) {
       tenantId: userId,          // keep this for stream.js compatibility
       tenantName: `User ${userId.slice(0, 8)}`,
       agentPersona: voiceSettings?.agent_persona || 'professional receptionist',
-      agentGreeting: voiceSettings?.agent_greeting ||
-        'Hello, thanks for calling. How can I help you today?',
+      // Browser/web-test calls never get the recording disclosure appended
+      // -- this path is what trial accounts use, and recording disclosure
+      // doesn't apply to a web test call the way it does a real phone call.
+      agentGreeting: buildGreeting(agentConfig, voiceSettings?.agent_greeting, false),
       preferredVoiceId: voiceSettings?.preferred_voice_id,
       callerNumber: 'browser',
       callStartTime: Date.now(),

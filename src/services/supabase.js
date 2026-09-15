@@ -116,6 +116,29 @@ async function getUserVoiceSettings(userId) {
   }
 }
 
+// ─── Get agent identity (name/company) for greeting substitution ──────────
+// Was missing from this file entirely -- call.js and browser.js had no way
+// to fill {{agent}}/{{company}} placeholders in a custom greeting without
+// this, which is why they were being spoken literally instead of replaced.
+async function getAgentConfig(userId) {
+  try {
+    const { data, error } = await supabase
+      .from('agent_configs')
+      .select('agent_nickname, organization_name, call_recording_enabled')
+      .eq('user_id', userId)
+      .single();
+
+    if (error || !data) {
+      return { agent_nickname: 'your assistant', organization_name: 'this business', call_recording_enabled: false };
+    }
+
+    return data;
+  } catch (err) {
+    console.error('[Supabase] getAgentConfig error:', err.message);
+    return { agent_nickname: 'your assistant', organization_name: 'this business', call_recording_enabled: false };
+  }
+}
+
 // ─── Check remaining voice quota ───────────────────────────
 // Supabase JS client doesn't support SQL aggregates in .select()
 // so we fetch rows for the current month and sum in JS
@@ -246,6 +269,7 @@ module.exports = {
   getUserByPhone,
   getUserById,
   getUserVoiceSettings,
+  getAgentConfig,
   checkQuota,
   deductMinutes,
   saveCallTranscript

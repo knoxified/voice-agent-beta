@@ -1,7 +1,8 @@
-const { checkQuota, getUserByPhone, getUserVoiceSettings, saveCallTranscript } = require('../services/supabase');
+const { checkQuota, getUserByPhone, getUserVoiceSettings, getAgentConfig, saveCallTranscript } = require('../services/supabase');
 const { initSession, destroySession, getSession } = require('../services/session');
 const { deductMinutes } = require('../services/quota');
 const { makeOutboundCall } = require('../services/telnyx');  // only needed for Telnyx outbound
+const { buildGreeting } = require('../services/greeting');
 
 // ─── INBOUND: Telnyx hits this when someone calls your number ─
 // Now also handles Twilio by dispatching to the right provider handler.
@@ -70,8 +71,9 @@ async function handleTelnyxInbound(req, res, body) {
       });
     }
 
-    // Step 3: Get voice settings
+    // Step 3: Get voice settings + agent identity
     const voiceSettings = await getUserVoiceSettings(user.id);
+    const agentConfig = await getAgentConfig(user.id);
 
     // Step 4: Store session
     await initSession(callControlId, {
@@ -79,7 +81,7 @@ async function handleTelnyxInbound(req, res, body) {
       userId: user.id,
       userEmail: user.email,
       agentPersona: voiceSettings?.agent_persona || 'professional receptionist',
-      agentGreeting: voiceSettings?.agent_greeting || 'Hello, thank you for calling. How can I help you?',
+      agentGreeting: buildGreeting(agentConfig, voiceSettings?.agent_greeting, !!agentConfig?.call_recording_enabled),
       preferredVoiceId: voiceSettings?.preferred_voice_id || 'e07c00bc-4134-4eae-9ea4-1a55fb45746b',
       callerNumber: fromNumber,
       callStartTime: Date.now(),
@@ -153,8 +155,9 @@ async function handleTwilioInbound(req, res, body) {
     return res.send(twiml);
   }
 
-  // Step 3: Get dynamic voice settings (same as Telnyx)
+  // Step 3: Get dynamic voice settings + agent identity (same as Telnyx)
   const voiceSettings = await getUserVoiceSettings(user.id);
+  const agentConfig = await getAgentConfig(user.id);
 
   // Step 4: Store session with provider:'twilio'
   await initSession(CallSid, {
@@ -162,7 +165,7 @@ async function handleTwilioInbound(req, res, body) {
     userId: user.id,
     userEmail: user.email,
     agentPersona: voiceSettings?.agent_persona || 'professional receptionist',
-    agentGreeting: voiceSettings?.agent_greeting || 'Hello, thank you for calling. How can I help you?',
+    agentGreeting: buildGreeting(agentConfig, voiceSettings?.agent_greeting, !!agentConfig?.call_recording_enabled),
     preferredVoiceId: voiceSettings?.preferred_voice_id || 'e07c00bc-4134-4eae-9ea4-1a55fb45746b',
     callerNumber: From,
     callStartTime: Date.now(),
