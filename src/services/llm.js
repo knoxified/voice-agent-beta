@@ -12,13 +12,13 @@ const MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-20b';
 // chain-of-thought — so reasoning_effort is kept low.
 const IS_REASONING_MODEL = MODEL.startsWith('openai/gpt-oss');
 
-async function generateResponse(messages) {
+async function generateResponse(messages, temperature = 0.7) {
   try {
     const params = {
       model: MODEL,
       messages,
       max_tokens: IS_REASONING_MODEL ? 300 : 80,
-      temperature: 0.7,
+      temperature,
       stream: false
     };
     if (IS_REASONING_MODEL) {

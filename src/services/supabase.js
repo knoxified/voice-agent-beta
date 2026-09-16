@@ -124,7 +124,7 @@ async function getAgentConfig(userId) {
   try {
     const { data, error } = await supabase
       .from('agent_configs')
-      .select('agent_nickname, organization_name, call_recording_enabled')
+      .select('agent_nickname, organization_name, call_recording_enabled, system_type, temperature')
       .eq('user_id', userId)
       .single();
 
@@ -136,6 +136,51 @@ async function getAgentConfig(userId) {
   } catch (err) {
     console.error('[Supabase] getAgentConfig error:', err.message);
     return { agent_nickname: 'your assistant', organization_name: 'this business', call_recording_enabled: false };
+  }
+}
+
+// Industry-specific language for whichever systems (verticals) this user
+// has activated -- e.g. a plumbing company's agent should talk about
+// emergency triage and dispatch, not generic receptionist filler. Was
+// missing entirely from this non-edge path (stream.js's buildSystemPrompt
+// only used agentPersona/tenantName), which is why web-test and non-edge
+// phone calls never got real industry context the way edge calls did.
+async function getEnabledSystemPrompts(userId) {
+  try {
+    const { data, error } = await supabase
+      .from('user_systems')
+      .select('systems_catalog ( name, industry_prompt )')
+      .eq('user_id', userId)
+      .eq('is_enabled', true);
+
+    if (error || !data) return [];
+    return data
+      .map((row) => row.systems_catalog?.industry_prompt)
+      .filter((p) => typeof p === 'string' && p.trim().length > 0);
+  } catch (err) {
+    console.error('[Supabase] getEnabledSystemPrompts error:', err.message);
+    return [];
+  }
+}
+
+// Per-vertical voice defaults (temperature + tone), keyed by systemType --
+// pass agentConfig.system_type for a real call, or an explicit override for
+// a "preview this other vertical" call (the per-system preview widget).
+// Was missing entirely from this non-edge path, same gap as above.
+async function getSystemVoiceDefaults(systemType) {
+  if (!systemType || systemType === 'general') return null;
+  try {
+    const { data, error } = await supabase
+      .from('systems_catalog')
+      .select('default_temperature, tone_directive')
+      .eq('id', systemType)
+      .maybeSingle();
+
+    if (error || !data) return null;
+    return data;
+  } catch (err) {
+    console.error('[Supabase] getSystemVoiceDefaults error:', err.message);
+    return null;
   }
 }
 
@@ -270,6 +315,8 @@ module.exports = {
   getUserById,
   getUserVoiceSettings,
   getAgentConfig,
+  getEnabledSystemPrompts,
+  getSystemVoiceDefaults,
   checkQuota,
   deductMinutes,
   saveCallTranscript

@@ -72,9 +72,9 @@ async function browserTokenHandler(req, res) {
 // This is your TwiML App's Voice URL
 async function browserInboundHandler(req, res) {
   try {
-    const { userId, mode, CallSid } = req.body;
+    const { userId, mode, systemTypeOverride, CallSid } = req.body;
 
-    console.log(`[Browser] Call started | User: ${userId} | Mode: ${mode} | SID: ${CallSid}`);
+    console.log(`[Browser] Call started | User: ${userId} | Mode: ${mode} | SID: ${CallSid}${systemTypeOverride ? ` | Previewing: ${systemTypeOverride}` : ''}`);
 
     if (!userId) {
       const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -99,9 +99,38 @@ async function browserInboundHandler(req, res) {
     // literally on real calls.
     const { data: agentConfig } = await supabase
       .from('agent_configs')
-      .select('agent_nickname, organization_name')
+      .select('agent_nickname, organization_name, system_type, temperature')
       .eq('user_id', userId)
       .single();
+
+    // systemTypeOverride powers the per-system preview widget: lets someone
+    // hear how their agent would sound configured for a DIFFERENT vertical
+    // than their own, without changing their real settings. Falls back to
+    // their actual configured system_type for a normal (non-preview) call.
+    const effectiveSystemType = systemTypeOverride || agentConfig?.system_type;
+    const isPreview = Boolean(systemTypeOverride);
+
+    const [systemVoiceDefaults, industryPromptRows] = await Promise.all([
+      effectiveSystemType && effectiveSystemType !== 'general'
+        ? supabase.from('systems_catalog').select('default_temperature, tone_directive').eq('id', effectiveSystemType).maybeSingle().then(r => r.data)
+        : Promise.resolve(null),
+      isPreview
+        // Previewing a specific vertical: show that vertical's own
+        // industry context, not whichever systems this account happens to
+        // have enabled -- they may not have it enabled at all.
+        ? supabase.from('systems_catalog').select('industry_prompt').eq('id', effectiveSystemType).maybeSingle()
+            .then(r => r.data?.industry_prompt ? [r.data.industry_prompt] : [])
+        : supabase.from('user_systems').select('systems_catalog ( industry_prompt )').eq('user_id', userId).eq('is_enabled', true)
+            .then(r => (r.data || []).map(row => row.systems_catalog?.industry_prompt).filter(p => typeof p === 'string' && p.trim().length > 0)),
+    ]);
+
+    // Preview mode always uses the previewed vertical's own default tone --
+    // that's the entire point, hearing how THAT system sounds. A normal
+    // call still respects the account's own explicit override first.
+    const resolvedTemperature = isPreview
+      ? (systemVoiceDefaults?.default_temperature ?? 0.7)
+      : (agentConfig?.temperature ?? systemVoiceDefaults?.default_temperature ?? 0.7);
+    const toneDirective = systemVoiceDefaults?.tone_directive || null;
 
     // Load plan limits
     const { data: userData, error: planError } = await supabase
@@ -165,6 +194,11 @@ async function browserInboundHandler(req, res) {
       callStartTime: Date.now(),
       plan: userData?.plans?.name || 'free',
       isBrowserTest: mode === 'browser-test',
+      resolvedTemperature,
+      toneDirective,
+      industryPrompts: industryPromptRows,
+      isSystemPreview: isPreview,
+      previewedSystemType: isPreview ? effectiveSystemType : null,
       messages: []
     });
 

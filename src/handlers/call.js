@@ -1,8 +1,23 @@
-const { checkQuota, getUserByPhone, getUserVoiceSettings, getAgentConfig, saveCallTranscript } = require('../services/supabase');
+const { checkQuota, getUserByPhone, getUserVoiceSettings, getAgentConfig, getEnabledSystemPrompts, getSystemVoiceDefaults, saveCallTranscript } = require('../services/supabase');
 const { initSession, destroySession, getSession } = require('../services/session');
 const { deductMinutes } = require('../services/quota');
 const { makeOutboundCall } = require('../services/telnyx');  // only needed for Telnyx outbound
 const { buildGreeting } = require('../services/greeting');
+
+// Resolves per-vertical temperature/tone/industry-context for a real call,
+// using the account's own declared system_type. Shared by both Telnyx and
+// Twilio inbound handlers below rather than duplicated in each.
+async function resolveVoiceContext(userId, agentConfig) {
+  const [systemVoiceDefaults, industryPrompts] = await Promise.all([
+    getSystemVoiceDefaults(agentConfig?.system_type),
+    getEnabledSystemPrompts(userId),
+  ]);
+  return {
+    resolvedTemperature: agentConfig?.temperature ?? systemVoiceDefaults?.default_temperature ?? 0.7,
+    toneDirective: systemVoiceDefaults?.tone_directive || null,
+    industryPrompts,
+  };
+}
 
 // ─── INBOUND: Telnyx hits this when someone calls your number ─
 // Now also handles Twilio by dispatching to the right provider handler.
@@ -74,6 +89,7 @@ async function handleTelnyxInbound(req, res, body) {
     // Step 3: Get voice settings + agent identity
     const voiceSettings = await getUserVoiceSettings(user.id);
     const agentConfig = await getAgentConfig(user.id);
+    const voiceContext = await resolveVoiceContext(user.id, agentConfig);
 
     // Step 4: Store session
     await initSession(callControlId, {
@@ -86,7 +102,8 @@ async function handleTelnyxInbound(req, res, body) {
       callerNumber: fromNumber,
       callStartTime: Date.now(),
       plan: user.plan,
-      callAllowed: true
+      callAllowed: true,
+      ...voiceContext,
     });
 
     // Step 5: Answer the call
@@ -160,6 +177,7 @@ async function handleTwilioInbound(req, res, body) {
   const agentConfig = await getAgentConfig(user.id);
 
   // Step 4: Store session with provider:'twilio'
+  const voiceContext = await resolveVoiceContext(user.id, agentConfig);
   await initSession(CallSid, {
     provider: 'twilio',
     userId: user.id,
@@ -170,7 +188,8 @@ async function handleTwilioInbound(req, res, body) {
     callerNumber: From,
     callStartTime: Date.now(),
     plan: user.plan,
-    callAllowed: true
+    callAllowed: true,
+    ...voiceContext,
   });
 
   // Step 5: Respond with TwiML that connects audio to your existing WebSocket stream

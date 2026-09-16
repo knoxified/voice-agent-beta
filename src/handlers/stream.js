@@ -157,7 +157,7 @@ async function processTurn(ws, streamSid, callId, session, transcript, provider)
       : session.messages;
 
     const t2 = Date.now();
-    const aiText = await generateResponse(llmMessages);
+    const aiText = await generateResponse(llmMessages, session.resolvedTemperature);
     console.log(`[Timing] LLM: ${Date.now() - t2}ms`);
     console.log(`[LLM] "${aiText}"`);
 
@@ -203,9 +203,23 @@ function sendAudio(ws, streamSid, audioBuffer, provider) {
 
 // ─── System prompt ────────────────────────────────────────
 function buildSystemPrompt(session) {
-  return `You are an AI ${session.agentPersona || 'receptionist'} for ${session.tenantName || 'this business'}.
+  const parts = [
+    `You are an AI ${session.agentPersona || 'receptionist'} for ${session.tenantName || 'this business'}.`,
+  ];
 
-Rules — this is a phone call:
+  // Tone is HOW to speak, kept distinct from the industry context below
+  // (WHAT the business does) -- same split as the edge CallSession.js path,
+  // so a preview call gets the same real differentiation a live phone call
+  // does, not a flattened generic voice.
+  if (session.toneDirective) {
+    parts.push(`Tone for this call: ${session.toneDirective}`);
+  }
+
+  if (Array.isArray(session.industryPrompts) && session.industryPrompts.length > 0) {
+    parts.push('Industry context for this business:', ...session.industryPrompts);
+  }
+
+  parts.push(`Rules — this is a phone call:
 - Maximum 2 sentences per response, no exceptions
 - No bullet points, lists, or markdown ever
 - Speak naturally and conversationally
@@ -214,7 +228,9 @@ Rules — this is a phone call:
 
 Today: ${new Date().toLocaleDateString('en-US', {
     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
-  })}.`;
+  })}.`);
+
+  return parts.join('\n\n');
 }
 
 module.exports = { mediaStreamHandler };
