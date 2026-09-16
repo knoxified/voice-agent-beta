@@ -8,6 +8,7 @@ import {
   getUserVoiceSettings,
   getAgentConfig,
   getEnabledSystemPrompts,
+  getSystemVoiceDefaults,
   getRemainingMinutes,
   deductMinutes,
   saveCallTranscript,
@@ -229,6 +230,18 @@ export class CallSession {
     this.agentConfig = agentConfig || {};
     this.voiceSettingsGreeting = voiceSettings.agent_greeting;
 
+    // System-vertical voice defaults (temperature + tone), looked up by the
+    // business's own declared system_type. Resolution order: an explicit
+    // user-set temperature always wins (they know their own business
+    // better than a vertical default does); otherwise fall back to the
+    // vertical's default; otherwise the global 0.7 fallback.
+    const systemVoiceDefaults = await getSystemVoiceDefaults(this.env, this.agentConfig.system_type);
+    this.resolvedTemperature =
+      this.agentConfig.temperature != null ? this.agentConfig.temperature
+      : systemVoiceDefaults?.default_temperature != null ? systemVoiceDefaults.default_temperature
+      : 0.7;
+    this.toneDirective = systemVoiceDefaults?.tone_directive || null;
+
     this.remainingMinutesAtStart = await getRemainingMinutes(this.env, this.userId);
 
     this.messages = [
@@ -307,7 +320,7 @@ export class CallSession {
           }]
         : this.messages;
 
-      const aiText = await generateResponse(this.env, llmMessages);
+      const aiText = await generateResponse(this.env, llmMessages, this.resolvedTemperature);
       console.log(`[LLM] "${aiText}"`);
 
       if (!aiText) return;
@@ -391,6 +404,14 @@ export class CallSession {
     if (cfg.business_hours) lines.push(`- Business hours: ${cfg.business_hours}`);
     if (cfg.business_location) lines.push(`- Location: ${cfg.business_location}`);
     if (cfg.main_call_to_action) lines.push(`- Primary goal for callers: ${cfg.main_call_to_action}`);
+
+    // Tone directive is HOW to speak (pace, warmth, formality), kept
+    // distinct from systemPrompts below which is WHAT the business does --
+    // the two answer different questions and get injected separately
+    // rather than folded into one block.
+    if (this.toneDirective) {
+      lines.push('', `Tone for this call: ${this.toneDirective}`);
+    }
 
     // memory_context is the free-text business summary the client wrote or
     // generated via the "scan my website" feature -- this is the actual

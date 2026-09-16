@@ -9,7 +9,7 @@ function isReasoningModel(model) {
   return model.startsWith('openai/gpt-oss');
 }
 
-async function generateResponse(env, messages) {
+async function generateResponse(env, messages, temperature = 0.7) {
   const groq = new Groq({ apiKey: env.GROQ_API_KEY });
   const MODEL = env.GROQ_MODEL || 'openai/gpt-oss-20b';
   const reasoningModel = isReasoningModel(MODEL);
@@ -19,7 +19,7 @@ async function generateResponse(env, messages) {
       model: MODEL,
       messages,
       max_tokens: reasoningModel ? 300 : 80,
-      temperature: 0.7,
+      temperature,
       stream: false,
     };
     if (reasoningModel) {

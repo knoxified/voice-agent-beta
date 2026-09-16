@@ -294,7 +294,7 @@ async function getAgentConfig(env, userId) {
     const { data, error } = await supabase
       .from('agent_configs')
       .select(
-        'organization_name, agent_nickname, agent_position, business_hours, business_location, main_call_to_action, custom_system_prompt, memory_context, negative_instructions, call_recording_enabled'
+        'organization_name, agent_nickname, agent_position, business_hours, business_location, main_call_to_action, custom_system_prompt, memory_context, negative_instructions, call_recording_enabled, temperature, system_type'
       )
       .eq('user_id', userId)
       .maybeSingle();
@@ -303,6 +303,30 @@ async function getAgentConfig(env, userId) {
     return data;
   } catch (err) {
     console.error('[Supabase] getAgentConfig error:', err.message);
+    return null;
+  }
+}
+
+// Per-vertical voice defaults (temperature + tone directive), keyed by the
+// business's own declared system_type. An explicit user override in
+// agent_configs.temperature still takes precedence over this -- see
+// CallSession.js for the resolution order. Falls back to null (caller
+// applies its own global default) if system_type is unset, 'general', or
+// doesn't match a real systems_catalog row.
+async function getSystemVoiceDefaults(env, systemType) {
+  if (!systemType || systemType === 'general') return null;
+  const supabase = db(env);
+  try {
+    const { data, error } = await supabase
+      .from('systems_catalog')
+      .select('default_temperature, tone_directive')
+      .eq('id', systemType)
+      .maybeSingle();
+
+    if (error || !data) return null;
+    return data;
+  } catch (err) {
+    console.error('[Supabase] getSystemVoiceDefaults error:', err.message);
     return null;
   }
 }
@@ -332,6 +356,7 @@ export {
   getUserVoiceSettings,
   getAgentConfig,
   getEnabledSystemPrompts,
+  getSystemVoiceDefaults,
   logUnmatchedInboundCall,
   checkQuota,
   getRemainingMinutes,
