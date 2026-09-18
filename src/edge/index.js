@@ -150,6 +150,11 @@ app.post('/twiml/web-call', async (c) => {
   const callSid = body.CallSid;
   const from = body.From || '';
   const userId = from.replace(/^client:/, '');
+  // Lets the per-system preview widget hear a DIFFERENT vertical's
+  // tone/temperature than the account's own configured system_type,
+  // without changing their real settings. Passed through device.connect's
+  // params, arrives here the same way CallSid/From do.
+  const systemTypeOverride = typeof body.systemTypeOverride === 'string' ? body.systemTypeOverride : '';
 
   if (!userId || !callSid) {
     return twimlResponse(sayAndHangup("Sorry, we couldn't identify your account. Goodbye."));
@@ -174,6 +179,7 @@ app.post('/twiml/web-call', async (c) => {
     <Stream url="${escapeXml(streamUrl)}">
       <Parameter name="userId" value="${escapeXml(userId)}" />
       <Parameter name="provider" value="web" />
+      ${systemTypeOverride ? `<Parameter name="systemTypeOverride" value="${escapeXml(systemTypeOverride)}" />` : ''}
     </Stream>
   </Connect>
 </Response>`);

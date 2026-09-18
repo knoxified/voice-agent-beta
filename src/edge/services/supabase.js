@@ -13,7 +13,7 @@ async function getUserByPhone(env, phoneNumber) {
         user_id,
         users!inner (
           id, email, plan_id, status,
-          plans ( id, name, limit_voice_minutes )
+          plans ( id, name, limit_voice_minutes, price )
         )
       `)
       .eq('phone_number', phoneNumber)
@@ -32,7 +32,12 @@ async function getUserByPhone(env, phoneNumber) {
       planId: data.users.plan_id,
       limitVoiceMinutes: data.users.plans?.limit_voice_minutes || 0,
       status: data.users.status,
-      isTrial: data.users.plans?.name === 'Trial Package',
+      // price-based, not a name match -- a test/manually-migrated account
+      // can end up with a plan name that no longer matches an exact
+      // string like 'Trial Package' even though it's genuinely paid, and
+      // this is what was causing the trial preview notice to still play
+      // on a Pro account.
+      isTrial: !(data.users.plans?.price > 0),
     };
   } catch (err) {
     console.error('[Supabase] getUserByPhone error:', err.message);
@@ -47,7 +52,7 @@ async function getUserById(env, userId) {
       .from('users')
       .select(`
         id, email, plan_id, status,
-        plans ( id, name, limit_voice_minutes )
+        plans ( id, name, limit_voice_minutes, price )
       `)
       .eq('id', userId)
       .single();
@@ -64,7 +69,8 @@ async function getUserById(env, userId) {
       planId: data.plan_id,
       limitVoiceMinutes: data.plans?.limit_voice_minutes || 0,
       status: data.status,
-      isTrial: data.plans?.name === 'Trial Package',
+      // price-based, not a name match -- see getUserByPhone above for why
+      isTrial: !(data.plans?.price > 0),
     };
   } catch (err) {
     console.error('[Supabase] getUserById error:', err.message);
@@ -269,9 +275,22 @@ async function saveCallRecordingUrl(env, callId, recordingUrl) {
 // emergency triage and dispatch, not generic receptionist filler. Each
 // system's industry_prompt is authored to match the real language used on
 // the marketing site for that vertical (see systems_catalog).
-async function getEnabledSystemPrompts(env, userId) {
+async function getEnabledSystemPrompts(env, userId, overrideSystemType = null) {
   const supabase = db(env);
   try {
+    // Preview mode (overrideSystemType set): show THAT vertical's own
+    // industry context directly, regardless of whether this account has
+    // it enabled at all -- they may not, that's the point of previewing it.
+    if (overrideSystemType) {
+      const { data, error } = await supabase
+        .from('systems_catalog')
+        .select('industry_prompt')
+        .eq('id', overrideSystemType)
+        .maybeSingle();
+      if (error || !data?.industry_prompt) return [];
+      return [data.industry_prompt];
+    }
+
     const { data, error } = await supabase
       .from('user_systems')
       .select('systems_catalog ( name, industry_prompt )')

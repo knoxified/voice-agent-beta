@@ -26,6 +26,7 @@ export class CallSession {
     this.provider = null;
     this.isWebCall = false;
     this.isTrial = false;
+    this.systemTypeOverride = null;
     this.messages = [];
     this.streamSid = null;
 
@@ -205,6 +206,9 @@ export class CallSession {
       this.provider = msg.start.customParameters.provider;
       this.isWebCall = this.provider === 'web';
     }
+    if (msg.start?.customParameters?.systemTypeOverride) {
+      this.systemTypeOverride = msg.start.customParameters.systemTypeOverride;
+    }
 
     console.log(`[Stream] Start event | streamSid: ${this.streamSid} | callId: ${this.callId} | userId: ${this.userId}`);
 
@@ -223,23 +227,26 @@ export class CallSession {
     const [voiceSettings, agentConfig, systemPrompts] = await Promise.all([
       getUserVoiceSettings(this.env, this.userId),
       getAgentConfig(this.env, this.userId),
-      getEnabledSystemPrompts(this.env, this.userId),
+      getEnabledSystemPrompts(this.env, this.userId, this.systemTypeOverride || null),
     ]);
     this.quotaExceededMessage = voiceSettings.quota_exceeded_message;
     this.voiceId = voiceSettings.preferred_voice_id;
     this.agentConfig = agentConfig || {};
     this.voiceSettingsGreeting = voiceSettings.agent_greeting;
 
-    // System-vertical voice defaults (temperature + tone), looked up by the
-    // business's own declared system_type. Resolution order: an explicit
-    // user-set temperature always wins (they know their own business
-    // better than a vertical default does); otherwise fall back to the
-    // vertical's default; otherwise the global 0.7 fallback.
-    const systemVoiceDefaults = await getSystemVoiceDefaults(this.env, this.agentConfig.system_type);
-    this.resolvedTemperature =
-      this.agentConfig.temperature != null ? this.agentConfig.temperature
-      : systemVoiceDefaults?.default_temperature != null ? systemVoiceDefaults.default_temperature
-      : 0.7;
+    // System-vertical voice defaults (temperature + tone). Preview mode
+    // (systemTypeOverride set, from the per-system preview widget) always
+    // uses the previewed vertical's own default -- that's the entire
+    // point, hearing how THAT system sounds, regardless of this account's
+    // own temperature override. A normal call still respects the
+    // account's own explicit override first.
+    const effectiveSystemType = this.systemTypeOverride || this.agentConfig.system_type;
+    const systemVoiceDefaults = await getSystemVoiceDefaults(this.env, effectiveSystemType);
+    this.resolvedTemperature = this.systemTypeOverride
+      ? (systemVoiceDefaults?.default_temperature ?? 0.7)
+      : (this.agentConfig.temperature != null ? this.agentConfig.temperature
+        : systemVoiceDefaults?.default_temperature != null ? systemVoiceDefaults.default_temperature
+        : 0.7);
     this.toneDirective = systemVoiceDefaults?.tone_directive || null;
 
     this.remainingMinutesAtStart = await getRemainingMinutes(this.env, this.userId);
