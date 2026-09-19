@@ -118,7 +118,7 @@ app.post('/voice/preview', async (c) => {
     getAgentConfig(c.env, user.id),
   ]);
 
-  const previewText = buildGreeting(agentConfig, voiceSettings?.agent_greeting);
+  const previewText = buildGreeting(agentConfig, voiceSettings?.agent_greeting, false, agentConfig?.require_ai_disclosure !== false);
 
   try {
     const audio = await synthesizeSpeech(c.env, previewText, voiceSettings?.preferred_voice_id, 'mp3');

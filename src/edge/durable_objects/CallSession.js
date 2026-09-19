@@ -294,7 +294,11 @@ export class CallSession {
       }
 
       const recordingEnabled = Boolean(this.agentConfig?.call_recording_enabled);
-      const greetingText = buildGreeting(this.agentConfig, this.voiceSettingsGreeting, recordingEnabled);
+      // Defaults to required (matches the DB column's own default) --
+      // fail-safe toward MORE disclosure, not less, for a real legal
+      // requirement. Only skipped if explicitly set to false.
+      const aiDisclosureRequired = this.agentConfig?.require_ai_disclosure !== false;
+      const greetingText = buildGreeting(this.agentConfig, this.voiceSettingsGreeting, recordingEnabled, aiDisclosureRequired);
       console.log(`[Stream] Synthesizing greeting: "${greetingText}"`);
       const greetingAudio = await synthesizeSpeech(this.env, greetingText, this.voiceId);
       console.log('[Stream] Greeting audio received, sending to caller');
