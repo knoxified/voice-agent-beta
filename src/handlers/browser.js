@@ -188,7 +188,7 @@ async function browserInboundHandler(req, res) {
       // Browser/web-test calls never get the recording disclosure appended
       // -- this path is what trial accounts use, and recording disclosure
       // doesn't apply to a web test call the way it does a real phone call.
-      agentGreeting: buildGreeting(agentConfig, voiceSettings?.agent_greeting, false),
+      agentGreeting: buildGreeting(agentConfig, voiceSettings?.agent_greeting, false, agentConfig?.require_ai_disclosure !== false),
       preferredVoiceId: voiceSettings?.preferred_voice_id,
       callerNumber: 'browser',
       callStartTime: Date.now(),

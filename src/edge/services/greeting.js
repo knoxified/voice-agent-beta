@@ -38,10 +38,19 @@ function buildGreeting(agentConfig, customGreeting, recordingEnabled = false, ai
   const agentName = cfg.agent_nickname || 'your assistant';
   const companyName = cfg.organization_name || 'this business';
 
-  const notices = [];
-  if (aiDisclosureRequired) notices.push(AI_DISCLOSURE_NOTICE);
-  if (recordingEnabled) notices.push(RECORDING_NOTICE);
-  const combinedNotice = notices.join(', ');
+  // Default opening: business name FIRST (callers immediately know they
+  // reached the right place), then ONE short identity clause carrying
+  // whichever disclosures apply, then a question so the caller knows it is
+  // their turn to speak. Evidence: a 450k-call analysis found disclosing
+  // the AI, naming the business, mentioning recording and ending on a
+  // question were each associated with fewer hang-ups, while greeting
+  // length and question style did not matter. Disclosure is also legally
+  // required up front in some jurisdictions, so it is never optional here.
+  const identity = aiDisclosureRequired ? `${agentName}, an AI assistant` : agentName;
+  const identityClause = recordingEnabled
+    ? `This is ${identity}, ${RECORDING_NOTICE}.`
+    : `This is ${identity}.`;
+  const defaultGreeting = `Thank you for calling ${companyName}. ${identityClause} How can I help you today?`;
 
   if (customGreeting && customGreeting.trim().length > 0 && customGreeting.trim() !== GENERIC_DEFAULT_GREETING) {
     let greeting = customGreeting
@@ -61,9 +70,7 @@ function buildGreeting(agentConfig, customGreeting, recordingEnabled = false, ai
     const leftover = greeting.match(/\{\{\s*[\w-]+\s*\}\}/);
     if (leftover) {
       console.error('[Greeting] Unrecognized placeholder survived substitution:', leftover[0], '-- falling back to default greeting');
-      return combinedNotice
-        ? `Hi, this is ${agentName}, ${combinedNotice}, for ${companyName}. How can I help you today?`
-        : `Hi, this is ${agentName} from ${companyName}. How can I help you today?`;
+      return defaultGreeting;
     }
 
     // Whichever disclosures the custom greeting didn't explicitly place get
@@ -71,26 +78,28 @@ function buildGreeting(agentConfig, customGreeting, recordingEnabled = false, ai
     // appended as an afterthought -- and this always happens regardless of
     // what the custom text says, so a custom greeting can never silently
     // omit a required disclosure just by not mentioning it.
-    const missingNotices = [];
-    if (aiDisclosureRequired && !hasAiPlaceholder) missingNotices.push(AI_DISCLOSURE_NOTICE);
-    if (recordingEnabled && !hasRecordingPlaceholder) missingNotices.push(RECORDING_NOTICE);
+    // Inserted as its own short sentence right after the greeting's first
+    // sentence. Splicing the notices into the first clause reads as if the
+    // company itself is "an AI assistant" ("this is Alice from Acme, an AI
+    // assistant"), so a separate sentence is both clearer and legally safer.
+    const missingParts = [];
+    if (aiDisclosureRequired && !hasAiPlaceholder) missingParts.push("I'm an AI assistant");
+    if (recordingEnabled && !hasRecordingPlaceholder) missingParts.push(`this call is ${RECORDING_NOTICE}`);
 
-    if (missingNotices.length > 0) {
-      const toInsert = missingNotices.join(', ');
+    if (missingParts.length > 0) {
+      const sentence = `${missingParts.join(', and ')}.`;
       const firstSentenceEnd = greeting.search(/[.!?]/);
       if (firstSentenceEnd > -1) {
-        greeting = `${greeting.slice(0, firstSentenceEnd)}, ${toInsert}${greeting.slice(firstSentenceEnd)}`;
+        greeting = `${greeting.slice(0, firstSentenceEnd + 1)} ${sentence}${greeting.slice(firstSentenceEnd + 1)}`;
       } else {
-        greeting = `${greeting}, ${toInsert}.`;
+        greeting = `${greeting}. ${sentence}`;
       }
     }
 
     return greeting;
   }
 
-  return combinedNotice
-    ? `Hi, this is ${agentName}, ${combinedNotice}, for ${companyName}. How can I help you today?`
-    : `Hi, this is ${agentName} from ${companyName}. How can I help you today?`;
+  return defaultGreeting;
 }
 
 export { buildGreeting, GENERIC_DEFAULT_GREETING, RECORDING_NOTICE, AI_DISCLOSURE_NOTICE };

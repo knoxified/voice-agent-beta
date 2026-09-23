@@ -124,7 +124,7 @@ async function getAgentConfig(userId) {
   try {
     const { data, error } = await supabase
       .from('agent_configs')
-      .select('agent_nickname, organization_name, call_recording_enabled, system_type, temperature')
+      .select('agent_nickname, organization_name, call_recording_enabled, system_type, temperature, require_ai_disclosure')
       .eq('user_id', userId)
       .single();
 
