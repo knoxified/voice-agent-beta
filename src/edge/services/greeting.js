@@ -38,19 +38,18 @@ function buildGreeting(agentConfig, customGreeting, recordingEnabled = false, ai
   const agentName = cfg.agent_nickname || 'your assistant';
   const companyName = cfg.organization_name || 'this business';
 
-  // Default opening: business name FIRST (callers immediately know they
-  // reached the right place), then ONE short identity clause carrying
-  // whichever disclosures apply, then a question so the caller knows it is
-  // their turn to speak. Evidence: a 450k-call analysis found disclosing
-  // the AI, naming the business, mentioning recording and ending on a
-  // question were each associated with fewer hang-ups, while greeting
-  // length and question style did not matter. Disclosure is also legally
-  // required up front in some jurisdictions, so it is never optional here.
+  // Default opening: "Hello, this is <name>" -- a warm, person-first
+  // opener -- followed by whichever disclosures apply in the SAME clause,
+  // then a question so the caller knows it is their turn to speak. The
+  // agent name is whatever the account has (the DB default is "Alex" until
+  // the customer names it themselves). Disclosure is never optional here:
+  // it is legally required up front in some jurisdictions. A custom
+  // greeting can still say the business name via {{company}}.
   const identity = aiDisclosureRequired ? `${agentName}, an AI assistant` : agentName;
   const identityClause = recordingEnabled
-    ? `This is ${identity}, ${RECORDING_NOTICE}.`
-    : `This is ${identity}.`;
-  const defaultGreeting = `Thank you for calling ${companyName}. ${identityClause} How can I help you today?`;
+    ? `Hello, this is ${identity}, ${RECORDING_NOTICE}.`
+    : `Hello, this is ${identity}.`;
+  const defaultGreeting = `${identityClause} How can I help you today?`;
 
   if (customGreeting && customGreeting.trim().length > 0 && customGreeting.trim() !== GENERIC_DEFAULT_GREETING) {
     let greeting = customGreeting
