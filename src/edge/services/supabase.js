@@ -270,6 +270,32 @@ async function saveCallRecordingUrl(env, callId, recordingUrl) {
   }
 }
 
+// Turns a finished inbound call into a row on the user's Leads page (or bumps
+// the existing row for a repeat caller). The record_inbound_lead SQL function
+// does the insert-or-bump atomically and is idempotent per call_id, so it is
+// safe even though endCall() can be reached from more than one path. Purely
+// best-effort: a failure here must never affect the call or its transcript.
+async function recordInboundLead(env, userId, callerNumber, callId) {
+  if (!userId || !callerNumber || !callId) return;
+  // Withheld/anonymous caller IDs arrive as words, not numbers -- not a lead.
+  const phone = String(callerNumber).replace(/[\s()-]/g, '');
+  if (!/^\+?\d{6,15}$/.test(phone)) return;
+
+  const supabase = db(env);
+  try {
+    const { error } = await supabase.rpc('record_inbound_lead', {
+      p_user_id: userId,
+      p_phone: phone,
+      p_call_id: callId,
+    });
+    if (error) {
+      console.error('[Supabase] recordInboundLead error:', error.message);
+    }
+  } catch (err) {
+    console.error('[Supabase] recordInboundLead exception:', err.message);
+  }
+}
+
 // Industry-specific language for whichever systems (verticals) this user
 // has activated -- e.g. a plumbing company's agent should talk about
 // emergency triage and dispatch, not generic receptionist filler. Each
@@ -382,4 +408,5 @@ export {
   deductMinutes,
   saveCallTranscript,
   saveCallRecordingUrl,
+  recordInboundLead,
 };

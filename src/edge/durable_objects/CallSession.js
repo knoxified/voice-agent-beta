@@ -12,6 +12,7 @@ import {
   getRemainingMinutes,
   deductMinutes,
   saveCallTranscript,
+  recordInboundLead,
 } from '../services/supabase.js';
 import { buildGreeting } from '../services/greeting.js';
 
@@ -481,6 +482,15 @@ export class CallSession {
         durationSecs,
         this.messages
       );
+
+      // Only calls where the caller actually said something become leads --
+      // a hang-up during the greeting or a silent line is not a lead.
+      const callerSpoke = this.messages.some(
+        (m) => m.role === 'user' && typeof m.content === 'string' && m.content.trim().length > 0
+      );
+      if (callerSpoke) {
+        await recordInboundLead(this.env, this.userId, this.callerNumber, this.callId);
+      }
     }
 
     try {
