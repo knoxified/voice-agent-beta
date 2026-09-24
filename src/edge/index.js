@@ -7,6 +7,7 @@ import { synthesizeSpeech } from './services/tts.js';
 import { buildGreeting } from './services/greeting.js';
 import { createClient } from '@supabase/supabase-js';
 import { CallSession } from './durable_objects/CallSession.js';
+import { processDueEmails, unsubscribeByToken } from './services/emailSender.js';
 
 export { CallSession };
 
@@ -437,4 +438,45 @@ async function parseInboundBody(req) {
   return form;
 }
 
-export default app;
+// ---------- Email sequence unsubscribe (public, no auth) ----------
+// GET only shows a confirmation button: mail scanners prefetch links, and a
+// prefetch must never unsubscribe someone. POST does the work, and is also
+// what mail clients call for one-click List-Unsubscribe.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function unsubscribePage(title, message, token) {
+  const form = token
+    ? `<form method="POST" action="/unsubscribe/${token}"><button type="submit">Yes, unsubscribe me</button></form>`
+    : '';
+  return new Response(
+    `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title>` +
+      `<style>body{font-family:system-ui,sans-serif;background:#f8fafc;color:#0f172a;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}` +
+      `.card{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:32px;max-width:420px;text-align:center}` +
+      `button{background:#0f172a;color:#fff;border:0;border-radius:8px;padding:10px 18px;font-size:15px;cursor:pointer;margin-top:16px}</style></head>` +
+      `<body><div class="card"><h1 style="font-size:20px;margin:0 0 8px">${title}</h1><p style="color:#475569;margin:0">${message}</p>${form}</div></body></html>`,
+    { headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+  );
+}
+
+app.get('/unsubscribe/:token', (c) => {
+  const token = c.req.param('token');
+  if (!UUID_RE.test(token)) return unsubscribePage('Link not valid', 'This unsubscribe link is not valid.', null);
+  return unsubscribePage('Unsubscribe', 'Stop receiving emails from this sender?', token);
+});
+
+app.post('/unsubscribe/:token', async (c) => {
+  const token = c.req.param('token');
+  if (!UUID_RE.test(token)) return unsubscribePage('Link not valid', 'This unsubscribe link is not valid.', null);
+  const result = await unsubscribeByToken(c.env, token);
+  if (result === null) return unsubscribePage('Something went wrong', 'We could not process that just now. Please try again in a minute.', token);
+  if (result === false) return unsubscribePage('Link not valid', 'This unsubscribe link is not valid.', null);
+  return unsubscribePage("You're unsubscribed", 'You will not receive any more emails from this sender.', null);
+});
+
+export default {
+  fetch: app.fetch,
+  // Cron trigger (wrangler.jsonc): sends whichever sequence emails are due.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(processDueEmails(env));
+  },
+};
