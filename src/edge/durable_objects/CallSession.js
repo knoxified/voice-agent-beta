@@ -334,13 +334,16 @@ export class CallSession {
     try {
       this.messages.push({ role: 'user', content: transcript });
 
-      // Owner-defined routing rules win over booking-intent detection and
-      // the LLM: if the business said "billing -> transfer", that's what
-      // happens. Returns true when the rule fully handled this turn.
-      const rule = matchRoutingRule(this.routingRules, transcript);
-      if (rule && (await this.handleRoutingRule(rule))) return;
-
       const intent = detectIntent(transcript);
+
+      // Owner-defined routing rules are an optional override layer. They only
+      // get a say when the system's own intents (booking, availability...)
+      // did NOT match, so a system never depends on -- or gets hijacked by --
+      // a rule. Returns true when the rule fully handled this turn.
+      if (!intent) {
+        const rule = matchRoutingRule(this.routingRules, transcript);
+        if (rule && (await this.handleRoutingRule(rule))) return;
+      }
       let automationResult = null;
       if (intent) {
         console.log(`[Intent] ${intent.type}`);
