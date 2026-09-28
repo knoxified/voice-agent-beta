@@ -11,17 +11,21 @@
 // because the column is plain jsonb and anything could be in it.
 
 const E164 = /^\+[1-9]\d{7,14}$/;
-const MAX_RULES = 10;
+// Accounts with an enabled system get fewer rules: the system already handles
+// its own job, rules are only for exceptions. Starter (no system) gets more.
+const MAX_RULES_STARTER = 10;
+const MAX_RULES_WITH_SYSTEM = 3;
 const MAX_KEYWORDS = 10;
 
 function isValidE164(n) {
   return typeof n === 'string' && E164.test(n);
 }
 
-function sanitizeRules(raw) {
+function sanitizeRules(raw, hasSystem = false) {
   if (!Array.isArray(raw)) return [];
   const out = [];
-  for (const r of raw.slice(0, MAX_RULES)) {
+  const maxRules = hasSystem ? MAX_RULES_WITH_SYSTEM : MAX_RULES_STARTER;
+  for (const r of raw.slice(0, maxRules)) {
     if (!r || typeof r !== 'object') continue;
     const action = r.action === 'transfer' || r.action === 'reply' ? r.action : null;
     if (!action) continue;

@@ -244,7 +244,7 @@ export class CallSession {
 
     // Routing rules never apply to the per-system preview widget -- that's
     // for hearing a vertical's default voice, not this account's own setup.
-    this.routingRules = this.systemTypeOverride ? [] : sanitizeRules(this.agentConfig.custom_intents);
+    this.routingRules = this.systemTypeOverride ? [] : sanitizeRules(this.agentConfig.custom_intents, (systemPrompts || []).length > 0);
     this.transferNumber = isValidE164(this.agentConfig.business_phone) ? this.agentConfig.business_phone : null;
     this.voiceSettingsGreeting = voiceSettings.agent_greeting;
 
