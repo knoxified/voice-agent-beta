@@ -3,6 +3,8 @@ import { generateResponse } from '../services/llm.js';
 import { synthesizeSpeech } from '../services/tts.js';
 import { detectIntent, buildN8nPayload } from '../services/intent.js';
 import { triggerAutomation } from '../services/n8n.js';
+import { sanitizeRules, matchRoutingRule, isValidE164 } from '../services/routing.js';
+import { telnyxTransfer } from '../services/telnyx.js';
 import {
   getUserById,
   getUserVoiceSettings,
@@ -30,6 +32,12 @@ export class CallSession {
     this.systemTypeOverride = null;
     this.messages = [];
     this.streamSid = null;
+
+    // Owner-defined call routing (agent_configs.custom_intents). Loaded at
+    // call start; empty means every turn goes straight to the normal flow.
+    this.routingRules = [];
+    this.transferNumber = null;
+    this.transferInProgress = false;
 
     this.ws = null;
     this.dgWs = null;
@@ -233,6 +241,11 @@ export class CallSession {
     this.quotaExceededMessage = voiceSettings.quota_exceeded_message;
     this.voiceId = voiceSettings.preferred_voice_id;
     this.agentConfig = agentConfig || {};
+
+    // Routing rules never apply to the per-system preview widget -- that's
+    // for hearing a vertical's default voice, not this account's own setup.
+    this.routingRules = this.systemTypeOverride ? [] : sanitizeRules(this.agentConfig.custom_intents);
+    this.transferNumber = isValidE164(this.agentConfig.business_phone) ? this.agentConfig.business_phone : null;
     this.voiceSettingsGreeting = voiceSettings.agent_greeting;
 
     // System-vertical voice defaults (temperature + tone). Preview mode
@@ -314,8 +327,18 @@ export class CallSession {
     const turnStart = Date.now();
     console.log(`[STT] "${transcript}"`);
 
+    // A transfer is already handing the caller off; ignore anything still
+    // arriving from the STT stream so the agent doesn't talk over it.
+    if (this.transferInProgress) return;
+
     try {
       this.messages.push({ role: 'user', content: transcript });
+
+      // Owner-defined routing rules win over booking-intent detection and
+      // the LLM: if the business said "billing -> transfer", that's what
+      // happens. Returns true when the rule fully handled this turn.
+      const rule = matchRoutingRule(this.routingRules, transcript);
+      if (rule && (await this.handleRoutingRule(rule))) return;
 
       const intent = detectIntent(transcript);
       let automationResult = null;
@@ -360,6 +383,51 @@ export class CallSession {
         /* silent */
       }
     }
+  }
+
+  // Speak a fixed line and keep it in the transcript.
+  async speakLine(text) {
+    this.messages.push({ role: 'assistant', content: text });
+    if (this.messages.length > 22) {
+      const sys = this.messages[0];
+      this.messages = [sys, ...this.messages.slice(-20)];
+    }
+    const audio = await synthesizeSpeech(this.env, text, this.voiceId);
+    this.sendAudioToCaller(audio);
+  }
+
+  // Returns true if the rule fully handled the turn, false to fall through
+  // to the normal intent/LLM flow (e.g. a transfer rule on a call type that
+  // can't transfer -- better to answer normally than to go silent).
+  async handleRoutingRule(rule) {
+    console.log(`[Routing] matched "${rule.label || rule.keywords[0]}" -> ${rule.action}`);
+
+    if (rule.action === 'reply') {
+      await this.speakLine(rule.reply);
+      return true;
+    }
+
+    // action === 'transfer'
+    if (this.provider !== 'telnyx') {
+      console.warn(`[Routing] transfer not supported on provider "${this.provider}" -- falling through`);
+      return false;
+    }
+    if (!this.transferNumber) {
+      console.warn('[Routing] transfer rule matched but no valid business_phone is set -- falling through');
+      return false;
+    }
+
+    this.transferInProgress = true;
+    await this.speakLine("One moment, I'll connect you now.");
+    // Let the spoken line finish playing before Telnyx bridges the call.
+    await new Promise((r) => setTimeout(r, 2500));
+
+    const result = await telnyxTransfer(this.env, this.callId, this.transferNumber);
+    if (!result.ok) {
+      this.transferInProgress = false;
+      await this.speakLine("I'm sorry, I couldn't connect you just now. Is there anything else I can help with?");
+    }
+    return true;
   }
 
   async checkTrialQuota() {

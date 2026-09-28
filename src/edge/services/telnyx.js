@@ -37,4 +37,9 @@ const telnyxHangup = (env, callControlId, opts = {}) => telnyxAction(env, callCo
 const telnyxStreamingStart = (env, callControlId, streamUrl, opts = {}) =>
   telnyxAction(env, callControlId, 'streaming_start', { stream_url: streamUrl, stream_track: 'both_tracks', ...opts });
 
-export { telnyxAction, telnyxAnswer, telnyxSpeak, telnyxHangup, telnyxStreamingStart };
+// Blind-transfers the live call to `to` (E.164). Caller ID defaults to the
+// number the caller originally dialed, per Telnyx's docs.
+const telnyxTransfer = (env, callControlId, to, opts = {}) =>
+  telnyxAction(env, callControlId, 'transfer', { to, ...opts });
+
+export { telnyxAction, telnyxAnswer, telnyxSpeak, telnyxHangup, telnyxStreamingStart, telnyxTransfer };

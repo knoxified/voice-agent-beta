@@ -339,7 +339,7 @@ async function getAgentConfig(env, userId) {
     const { data, error } = await supabase
       .from('agent_configs')
       .select(
-        'organization_name, agent_nickname, agent_position, business_hours, business_location, main_call_to_action, custom_system_prompt, memory_context, negative_instructions, call_recording_enabled, temperature, system_type, require_ai_disclosure'
+        'organization_name, agent_nickname, agent_position, business_hours, business_location, main_call_to_action, custom_system_prompt, memory_context, negative_instructions, call_recording_enabled, temperature, system_type, require_ai_disclosure, custom_intents, business_phone'
       )
       .eq('user_id', userId)
       .maybeSingle();
