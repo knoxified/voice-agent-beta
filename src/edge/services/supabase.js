@@ -69,6 +69,7 @@ async function getUserById(env, userId) {
       planId: data.plan_id,
       limitVoiceMinutes: data.plans?.limit_voice_minutes || 0,
       status: data.status,
+      planPrice: data.plans?.price ?? null,
       // price-based, not a name match -- see getUserByPhone above for why
       isTrial: !(data.plans?.price > 0),
     };

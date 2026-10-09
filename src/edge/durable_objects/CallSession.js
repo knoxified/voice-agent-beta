@@ -231,7 +231,7 @@ export class CallSession {
 
     const user = await getUserById(this.env, this.userId);
     this.isTrial = user?.isTrial || false;
-    console.log(`[Stream] User loaded | isTrial: ${this.isTrial}`);
+    console.log(`[Stream] User loaded | userId: ${this.userId} | email: ${user?.email} | plan: ${user?.plan} | price: ${user?.planPrice} | isTrial: ${this.isTrial} | userFound: ${Boolean(user)}`);
 
     const [voiceSettings, agentConfig, systemPrompts] = await Promise.all([
       getUserVoiceSettings(this.env, this.userId),
@@ -302,6 +302,7 @@ export class CallSession {
       // preview, not a real phone call, before anything else -- separate
       // from and ahead of the greeting itself.
       if (this.isWebCall && this.isTrial) {
+        console.log(`[Stream] Playing trial preview notice | userId: ${this.userId} | isWebCall: ${this.isWebCall}`);
         const previewNotice = "This is a preview call to test your voice agent. Upgrade your plan to connect a real phone number. Here's what your customers would hear:";
         const previewAudio = await synthesizeSpeech(this.env, previewNotice, this.voiceId);
         this.sendAudioToCaller(previewAudio);
