@@ -4,6 +4,17 @@ function db(env) {
   return createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY);
 }
 
+// Single source of truth for "is this account on a free trial plan".
+// Only an account whose plan row is PRESENT and has no price counts as
+// trial. A missing or failed plan lookup is "unknown", never "trial", so a
+// lookup problem can never make a paying customer hear upgrade messaging.
+// Price-based on purpose (not a plan-name match) -- see getUserByPhone.
+function isTrialPlan(plan) {
+  const p = Array.isArray(plan) ? plan[0] : plan;
+  if (!p) return false;
+  return !(Number(p.price) > 0);
+}
+
 async function getUserByPhone(env, phoneNumber) {
   const supabase = db(env);
   try {
@@ -37,7 +48,7 @@ async function getUserByPhone(env, phoneNumber) {
       // string like 'Trial Package' even though it's genuinely paid, and
       // this is what was causing the trial preview notice to still play
       // on a Pro account.
-      isTrial: !(data.users.plans?.price > 0),
+      isTrial: isTrialPlan(data.users.plans),
     };
   } catch (err) {
     console.error('[Supabase] getUserByPhone error:', err.message);
@@ -70,7 +81,7 @@ async function getUserById(env, userId) {
       limitVoiceMinutes: data.plans?.limit_voice_minutes || 0,
       status: data.status,
       // price-based, not a name match -- see getUserByPhone above for why
-      isTrial: !(data.plans?.price > 0),
+      isTrial: isTrialPlan(data.plans),
     };
   } catch (err) {
     console.error('[Supabase] getUserById error:', err.message);
@@ -127,6 +138,9 @@ async function getUsedMinutesThisMonth(supabase, userId) {
 async function checkQuota(env, userId) {
   const supabase = db(env);
   const GENERIC_MESSAGE = 'Sorry, your minutes have been exhausted. Please upgrade your plan.';
+  // Spoken when OUR lookup fails. Never claim the customer is out of minutes
+  // or needs to upgrade because of a database error on our side.
+  const TECHNICAL_MESSAGE = "Sorry, we're having a technical problem on our side. Please try again in a moment.";
   try {
     const { data: userData, error: userError } = await supabase
       .from('users')
@@ -136,7 +150,7 @@ async function checkQuota(env, userId) {
 
     if (userError || !userData) {
       console.error('[Supabase] checkQuota user fetch error:', userError?.message);
-      return { ok: false, message: GENERIC_MESSAGE }; // Fail closed
+      return { ok: false, message: TECHNICAL_MESSAGE }; // Fail closed, truthfully
     }
 
     // Duplicate-account abuse lock: view/navigate the dashboard is still
@@ -150,7 +164,7 @@ async function checkQuota(env, userId) {
     if (limitMinutes === 0) return { ok: true, message: null }; // 0 = unlimited
 
     const used = await getUsedMinutesThisMonth(supabase, userId);
-    if (used === null) return { ok: false, message: GENERIC_MESSAGE }; // Fail closed on DB error
+    if (used === null) return { ok: false, message: TECHNICAL_MESSAGE }; // Fail closed on DB error, truthfully
 
     if (used < limitMinutes) return { ok: true, message: null };
 
@@ -159,14 +173,14 @@ async function checkQuota(env, userId) {
     // when they're already paying. plans.price > 0 is a reliable paid/trial
     // signal here (real pricing data already in this table), safer than
     // matching an exact plan name string that could drift out of sync.
-    const isPaidPlan = (userData.plans?.price || 0) > 0;
+    const isPaidPlan = !isTrialPlan(userData.plans) && Number((Array.isArray(userData.plans) ? userData.plans[0] : userData.plans)?.price) > 0;
     const message = isPaidPlan
       ? "You've used all your voice minutes for this billing cycle. They'll refresh at the start of your next cycle, or you can upgrade to a higher plan for more capacity."
       : GENERIC_MESSAGE;
     return { ok: false, message };
   } catch (err) {
     console.error('[Supabase] checkQuota error:', err.message);
-    return { ok: false, message: GENERIC_MESSAGE };
+    return { ok: false, message: TECHNICAL_MESSAGE };
   }
 }
 
