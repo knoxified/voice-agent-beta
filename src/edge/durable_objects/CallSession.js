@@ -298,15 +298,6 @@ export class CallSession {
     }
 
     try {
-      // Trial users testing via web call should clearly hear this is a
-      // preview, not a real phone call, before anything else -- separate
-      // from and ahead of the greeting itself.
-      if (this.isWebCall && this.isTrial) {
-        const previewNotice = "This is a preview call to test your voice agent. Upgrade your plan to connect a real phone number. Here's what your customers would hear:";
-        const previewAudio = await synthesizeSpeech(this.env, previewNotice, this.voiceId);
-        this.sendAudioToCaller(previewAudio);
-      }
-
       const recordingEnabled = Boolean(this.agentConfig?.call_recording_enabled);
       // Defaults to required (matches the DB column's own default) --
       // fail-safe toward MORE disclosure, not less, for a real legal
