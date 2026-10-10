@@ -116,23 +116,29 @@ async function getUserVoiceSettings(env, userId) {
 // aggregate strings like 'SUM(x) as total' inside .select() don't work.
 // Fetch the rows and sum in JS instead (same pattern checkQuota already
 // used correctly).
-async function getUsedMinutesThisMonth(supabase, userId) {
+// Usage is stored as whole SECONDS (seconds_used) so a 2-second call costs
+// 2 seconds, not a full minute. Rows written by the old minutes-only function
+// have seconds_used = 0 and minutes_used > 0, so fall back to minutes * 60.
+async function getUsedSecondsThisMonth(supabase, userId) {
   const startOfMonth = new Date();
   startOfMonth.setDate(1);
   startOfMonth.setHours(0, 0, 0, 0);
 
   const { data, error } = await supabase
     .from('voice_usage')
-    .select('minutes_used')
+    .select('minutes_used, seconds_used')
     .eq('user_id', userId)
     .gte('created_at', startOfMonth.toISOString());
 
   if (error) {
-    console.error('[Supabase] getUsedMinutesThisMonth error:', error.message);
+    console.error('[Supabase] getUsedSecondsThisMonth error:', error.message);
     return null;
   }
 
-  return (data || []).reduce((sum, row) => sum + (row.minutes_used || 0), 0);
+  return (data || []).reduce(
+    (sum, row) => sum + (row.seconds_used > 0 ? row.seconds_used : (row.minutes_used || 0) * 60),
+    0
+  );
 }
 
 async function checkQuota(env, userId) {
@@ -163,10 +169,11 @@ async function checkQuota(env, userId) {
     const limitMinutes = userData.plans?.limit_voice_minutes || 0;
     if (limitMinutes === 0) return { ok: true, message: null }; // 0 = unlimited
 
-    const used = await getUsedMinutesThisMonth(supabase, userId);
-    if (used === null) return { ok: false, message: TECHNICAL_MESSAGE }; // Fail closed on DB error, truthfully
+    const usedSeconds = await getUsedSecondsThisMonth(supabase, userId);
+    if (usedSeconds === null) return { ok: false, message: TECHNICAL_MESSAGE }; // Fail closed on DB error, truthfully
 
-    if (used < limitMinutes) return { ok: true, message: null };
+    // Exact: the cap is limitMinutes * 60 seconds, not a minute boundary.
+    if (usedSeconds < limitMinutes * 60) return { ok: true, message: null };
 
     // Real fix: a Pro/Starter/Enterprise customer hitting their configured
     // minute cap was hearing "please upgrade to a paid plan" -- nonsensical
@@ -184,7 +191,7 @@ async function checkQuota(env, userId) {
   }
 }
 
-/** Remaining minutes this month. Fixed: previously used an invalid SQL
+/** Remaining minutes this month (fractional, exact). Fixed: previously used an invalid SQL
  * aggregate string inside .select() that doesn't work with PostgREST. */
 async function getRemainingMinutes(env, userId) {
   const supabase = db(env);
@@ -198,32 +205,33 @@ async function getRemainingMinutes(env, userId) {
     const limitMinutes = userData?.plans?.limit_voice_minutes || 0;
     if (limitMinutes === 0) return Number.MAX_SAFE_INTEGER; // Unlimited
 
-    const used = await getUsedMinutesThisMonth(supabase, userId);
-    if (used === null) return 0;
+    const usedSeconds = await getUsedSecondsThisMonth(supabase, userId);
+    if (usedSeconds === null) return 0;
 
-    return Math.max(0, limitMinutes - used);
+    // Returned in minutes (fractional) so CallSession's countdown is exact.
+    return Math.max(0, (limitMinutes * 60 - usedSeconds) / 60);
   } catch (err) {
     console.error('[Supabase] getRemainingMinutes error:', err.message);
     return 0;
   }
 }
 
-async function deductMinutes(env, userId, minutesUsed, sessionId) {
+async function deductSeconds(env, userId, seconds, sessionId) {
   const supabase = db(env);
   try {
-    const { error } = await supabase.rpc('deduct_voice_minutes', {
+    const { error } = await supabase.rpc('deduct_voice_seconds', {
       p_user_id: userId,
-      p_minutes: minutesUsed,
+      p_seconds: seconds,
       p_session_id: sessionId || null,
     });
 
     if (error) {
-      console.error('[Supabase] deductMinutes error:', error.message);
+      console.error('[Supabase] deductSeconds error:', error.message);
     } else {
-      console.log(`[Supabase] Recorded ${minutesUsed} min for user ${userId}`);
+      console.log(`[Supabase] Recorded ${seconds}s for user ${userId}`);
     }
   } catch (err) {
-    console.error('[Supabase] deductMinutes exception:', err.message);
+    console.error('[Supabase] deductSeconds exception:', err.message);
   }
 }
 
@@ -419,7 +427,7 @@ export {
   logUnmatchedInboundCall,
   checkQuota,
   getRemainingMinutes,
-  deductMinutes,
+  deductSeconds,
   saveCallTranscript,
   saveCallRecordingUrl,
   recordInboundLead,

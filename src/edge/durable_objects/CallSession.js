@@ -12,7 +12,7 @@ import {
   getEnabledSystemPrompts,
   getSystemVoiceDefaults,
   getRemainingMinutes,
-  deductMinutes,
+  deductSeconds,
   saveCallTranscript,
   recordInboundLead,
 } from '../services/supabase.js';
@@ -527,11 +527,11 @@ export class CallSession {
 
     if (!this.callId || !this.callStartedAt) return;
 
+    // Exact seconds, no per-call rounding up to a whole minute.
     const durationSecs = Math.round((Date.now() - this.callStartedAt) / 1000);
-    const minutesUsed = Math.ceil(durationSecs / 60);
 
-    if (minutesUsed > 0) {
-      await deductMinutes(this.env, this.userId, minutesUsed, this.callId);
+    if (durationSecs > 0) {
+      await deductSeconds(this.env, this.userId, durationSecs, this.callId);
     }
 
     if (this.messages.length > 0) {
