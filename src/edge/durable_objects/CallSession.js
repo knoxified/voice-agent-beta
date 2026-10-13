@@ -209,6 +209,16 @@ export class CallSession {
 
   async handleStart(msg) {
     this.streamSid = msg.streamSid || (this.isBrowserCall ? 'browser' : undefined);
+
+    // Browser calls may send 16 kHz linear PCM (much better recognition than
+    // 8 kHz mu-law). Older clients send no mediaFormat and keep mu-law 8 kHz.
+    this.sttFormat = { encoding: 'mulaw', sampleRate: 8000 };
+    if (this.isBrowserCall) {
+      const mf = msg.start?.mediaFormat;
+      if (mf && /l16|linear16/i.test(String(mf.encoding || '')) && Number(mf.sampleRate) === 16000) {
+        this.sttFormat = { encoding: 'linear16', sampleRate: 16000 };
+      }
+    }
     if (!this.isBrowserCall) {
       this.callId =
         msg.start?.customParameters?.CallSid ||
@@ -323,7 +333,8 @@ export class CallSession {
           this.isProcessing = false;
         },
         (err) => console.error('[STT] Connection error:', err.message || err),
-        () => this.markCallerActivity()
+        () => this.markCallerActivity(),
+        { ...this.sttFormat, keyterms: this.buildKeyterms() }
       );
       console.log('[Stream] Deepgram WebSocket connected');
     } catch (err) {
@@ -445,6 +456,24 @@ export class CallSession {
         /* silent */
       }
     }
+  }
+
+  // Words Deepgram should be primed to recognise (Nova-3 keyterm prompting).
+  buildKeyterms() {
+    const cfg = this.agentConfig || {};
+    const raw = [cfg.organization_name, cfg.agent_nickname, ...String(cfg.organization_name || '').split(/\s+/)];
+    const seen = new Set();
+    const out = [];
+    for (const t of raw) {
+      const term = String(t || '').trim();
+      if (term.length < 3 || term.length > 40 || /^(my|business|the|and|inc|llc)$/i.test(term)) continue;
+      const key = term.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(term);
+      if (out.length >= 10) break;
+    }
+    return out;
   }
 
   pushAssistant(text) {
