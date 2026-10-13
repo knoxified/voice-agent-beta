@@ -30,7 +30,7 @@ async function triggerAutomation(env, intentType, payload) {
     });
 
     const data = await res.json().catch(() => null);
-    console.log(`[n8n] Response for ${intentType}:`, data);
+    console.log(`[n8n] ${intentType} -> HTTP ${res.status}`, JSON.stringify(data)?.slice(0, 300));
     return data;
   } catch (err) {
     // Don't crash the call if n8n fails -- the AI handles it gracefully.

@@ -3,7 +3,7 @@ import { generateWithTools } from '../services/llm.js';
 import { synthesizeSpeech, streamSpeech } from '../services/tts.js';
 import { TOOL_DEFS, executeTool, businessTimeZone } from '../services/tools.js';
 import { sanitizeRules, matchRoutingRule, isValidE164 } from '../services/routing.js';
-import { telnyxTransfer } from '../services/telnyx.js';
+import { telnyxTransfer, telnyxHangup } from '../services/telnyx.js';
 import {
   getUserById,
   getUserVoiceSettings,
@@ -436,11 +436,24 @@ export class CallSession {
         else return;
       }
 
+      // End-of-call: the model appends [END] to its final goodbye; as a safety
+      // net also end when the caller closed AND the agent said a farewell.
+      let endAfter = /\[END\]/i.test(aiText);
+      aiText = aiText.replace(/\s*\[END\]\s*/gi, ' ').trim();
+      if (!endAfter && FAREWELL_RE.test(aiText) && CALLER_CLOSING_RE.test(transcript)) endAfter = true;
+      if (!aiText) aiText = 'Take care.';
+
       this.pushAssistant(aiText);
 
       const ttsStart = Date.now();
       await this.speak(aiText);
       t.tts += Date.now() - ttsStart;
+
+      if (endAfter) {
+        console.log('[Call] Ending call after goodbye');
+        await this.hangUpAfterPlayback();
+        return;
+      }
 
       console.log(`[Timing] Turn: ${Date.now() - turnStart}ms | llm ${t.llm}ms (${t.rounds} call${t.rounds === 1 ? '' : 's'}) | tts ${t.tts}ms | tools ${t.tools}ms | promptMsgs ${working.length}`);
 
@@ -487,6 +500,17 @@ export class CallSession {
   async speakFiller(text) {
     this.pushAssistant(text);
     await this.speak(text);
+  }
+
+  // Let the last spoken line finish playing, then really hang up.
+  async hangUpAfterPlayback() {
+    this.ending = true;
+    const waitMs = Math.max(0, this.agentSpeakingUntil - Date.now()) + 800;
+    await new Promise((r) => setTimeout(r, waitMs));
+    if (this.provider === 'telnyx' && this.callId) {
+      await telnyxHangup(this.env, this.callId);
+    }
+    await this.endCall();
   }
 
   // Speak text to the caller, streaming audio as it is generated.
@@ -563,9 +587,7 @@ export class CallSession {
       this.ending = true;
       try {
         await this.speakLine(pickRandom(SILENCE_GOODBYE_LINES));
-        const waitMs = Math.max(0, this.agentSpeakingUntil - Date.now()) + 700;
-        await new Promise((r) => setTimeout(r, waitMs));
-        await this.endCall();
+        await this.hangUpAfterPlayback();
       } finally {
         this.silenceBusy = false;
       }
@@ -677,6 +699,7 @@ export class CallSession {
       '- Use their name rarely, at most once or twice in a whole call.',
       '- A light human touch is fine, such as "hm", "oh", "well", "right" now and then, but never forced.',
       '- If you do not know something, say so plainly and offer to have someone follow up.',
+      '- Ending the call: when the caller has clearly finished (says bye, thanks that is all, nothing else) give one short warm goodbye and put the exact marker [END] at the very end of that final message. Use [END] only for that final goodbye, never mid-conversation, and never mention it. Do not offer more help after they have said they are done.',
       '- You are an AI and the greeting already said so. Never pretend to be human, and if someone sincerely asks whether you are a person, tell them the truth in one calm sentence and carry on.',
     ];
 
@@ -844,3 +867,6 @@ function pickRandom(arr) {
 function pickFiller(toolName) {
   return pickRandom(FILLERS[toolName] || ['One moment.']);
 }
+
+const FAREWELL_RE = /\b(take care|goodbye|good bye|bye|have a (great|good|nice|wonderful|lovely) (day|one|evening|night|week)|talk (to you )?soon|speak soon)\b/i;
+const CALLER_CLOSING_RE = /\b(bye|goodbye|that'?s (all|it)|nothing else|no,? (thanks|thank you)|(ok(ay)?|alright|great|perfect|cool|sure)[.,!\s]+thank(s| you)|thank(s| you)[.,!\s]+(bye|that'?s all))\b/i;
