@@ -28,6 +28,7 @@ export class CallSession {
     this.callerNumber = null;
     this.provider = null;
     this.isWebCall = false;
+    this.isBrowserCall = false; // browser-direct web call: no Twilio/Telnyx
     this.isTrial = false;
     this.systemTypeOverride = null;
     this.messages = [];
@@ -126,6 +127,13 @@ export class CallSession {
     this.callerNumber = url.searchParams.get('callerNumber') || null;
     this.provider = url.searchParams.get('provider') || 'web';
     this.isWebCall = this.provider === 'web';
+    this.isBrowserCall = this.provider === 'browser';
+    if (this.isBrowserCall) {
+      // userId was verified from a signed token by the stream route; the call
+      // id is the (verified) last path segment, never taken from the client.
+      this.callId = url.pathname.split('/').pop();
+      this.systemTypeOverride = url.searchParams.get('systemTypeOverride') || null;
+    }
 
     console.log(`[Stream] Upgrade request | user: ${this.userId} | provider: ${this.provider}`);
 
@@ -185,13 +193,15 @@ export class CallSession {
   }
 
   async handleStart(msg) {
-    this.streamSid = msg.streamSid;
-    this.callId =
-      msg.start?.customParameters?.CallSid ||
-      msg.start?.callSid ||
-      msg.start?.call_control_id;
+    this.streamSid = msg.streamSid || (this.isBrowserCall ? 'browser' : undefined);
+    if (!this.isBrowserCall) {
+      this.callId =
+        msg.start?.customParameters?.CallSid ||
+        msg.start?.callSid ||
+        msg.start?.call_control_id;
+    }
 
-    if (!this.callId && msg.start?.stream_sid) {
+    if (!this.isBrowserCall && !this.callId && msg.start?.stream_sid) {
       this.streamSid = msg.start.stream_sid;
       this.callId = msg.start.call_control_id;
     }
@@ -205,18 +215,22 @@ export class CallSession {
     // that don't go through TwiML (Telnyx's streaming_start command
     // passes stream_url directly, so its query string isn't subject to
     // this limitation).
-    if (msg.start?.customParameters?.userId) {
-      this.userId = msg.start.customParameters.userId;
-    }
-    if (msg.start?.customParameters?.callerNumber) {
-      this.callerNumber = msg.start.customParameters.callerNumber;
-    }
-    if (msg.start?.customParameters?.provider) {
-      this.provider = msg.start.customParameters.provider;
-      this.isWebCall = this.provider === 'web';
-    }
-    if (msg.start?.customParameters?.systemTypeOverride) {
-      this.systemTypeOverride = msg.start.customParameters.systemTypeOverride;
+    // Browser-direct calls never take identity or overrides from the client's
+    // start frame -- only the values verified from the signed token.
+    if (!this.isBrowserCall) {
+      if (msg.start?.customParameters?.userId) {
+        this.userId = msg.start.customParameters.userId;
+      }
+      if (msg.start?.customParameters?.callerNumber) {
+        this.callerNumber = msg.start.customParameters.callerNumber;
+      }
+      if (msg.start?.customParameters?.provider) {
+        this.provider = msg.start.customParameters.provider;
+        this.isWebCall = this.provider === 'web';
+      }
+      if (msg.start?.customParameters?.systemTypeOverride) {
+        this.systemTypeOverride = msg.start.customParameters.systemTypeOverride;
+      }
     }
 
     console.log(`[Stream] Start event | streamSid: ${this.streamSid} | callId: ${this.callId} | userId: ${this.userId}`);
@@ -448,7 +462,7 @@ export class CallSession {
     if (!audioBytes || this.ws.readyState !== 1) return;
     if (audioBytes.__telnyxNativeTTS) return;
 
-    const sidKey = (this.provider === 'twilio' || this.provider === 'web') ? 'streamSid' : 'stream_sid';
+    const sidKey = (this.provider === 'twilio' || this.provider === 'web' || this.provider === 'browser') ? 'streamSid' : 'stream_sid';
     this.ws.send(
       JSON.stringify({
         event: 'media',

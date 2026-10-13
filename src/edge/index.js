@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { mintVoiceAccessToken } from './services/twilioToken.js';
+import { signWebcallToken, verifyWebcallToken } from './services/webcallToken.js';
 import { telnyxAnswer, telnyxSpeak, telnyxHangup, telnyxStreamingStart } from './services/telnyx.js';
 import { getUserById, getUserByPhone, checkQuota, logUnmatchedInboundCall, getUserVoiceSettings, getAgentConfig, saveCallRecordingUrl } from './services/supabase.js';
 import { synthesizeSpeech } from './services/tts.js';
@@ -134,7 +135,7 @@ app.post('/voice/preview', async (c) => {
 });
 
 app.post('/voice/web-call/start', async (c) => {
-  const { userId } = await c.req.json().catch(() => ({}));
+  const { userId, direct, systemTypeOverride } = await c.req.json().catch(() => ({}));
   if (!userId) return c.json({ error: 'missing_userId' }, 400);
 
   const user = await getUserById(c.env, userId);
@@ -142,6 +143,15 @@ app.post('/voice/web-call/start', async (c) => {
 
   const quota = await checkQuota(c.env, userId);
   if (!quota.ok) return c.json({ error: 'quota_exceeded', message: quota.message }, 402);
+
+  // Browser-direct call: no Twilio/Telnyx involved. Hand back a call-bound
+  // signed token the browser presents when it opens the stream WebSocket.
+  if (direct) {
+    const override = typeof systemTypeOverride === 'string' ? systemTypeOverride.slice(0, 64) : '';
+    const callId = `browser-${crypto.randomUUID()}`;
+    const token = await signWebcallToken(c.env, { userId, callId, systemTypeOverride: override });
+    return c.json({ ready: true, direct: { callId, token } });
+  }
 
   return c.json({ ready: true });
 });
@@ -353,9 +363,25 @@ async function handleTelnyxInbound(c, body) {
 
 app.get('/voice/stream/:callId', async (c) => {
   const callId = c.req.param('callId');
+  let req = c.req.raw;
+
+  // Browser-direct web call: verify the signed token here, then forward only
+  // server-verified values. Anything the browser put in the query string
+  // (userId, systemTypeOverride) is discarded.
+  const url = new URL(c.req.url);
+  if (url.searchParams.get('provider') === 'browser') {
+    const claims = await verifyWebcallToken(c.env, url.searchParams.get('token'), callId);
+    if (!claims) return c.text('Invalid or expired web call token', 401);
+    const clean = new URL(url.origin + url.pathname);
+    clean.searchParams.set('provider', 'browser');
+    clean.searchParams.set('userId', claims.userId);
+    if (claims.systemTypeOverride) clean.searchParams.set('systemTypeOverride', claims.systemTypeOverride);
+    req = new Request(clean.toString(), c.req.raw);
+  }
+
   const id = c.env.CALL_SESSION.idFromName(callId);
   const stub = c.env.CALL_SESSION.get(id);
-  return stub.fetch(c.req.raw);
+  return stub.fetch(req);
 });
 
 // Prefer the originally-dialed number a carrier passed through on a
