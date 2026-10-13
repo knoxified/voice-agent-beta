@@ -1,6 +1,6 @@
 import { createLiveTranscription, sendAudio as sendToDeepgram, keepAlive } from '../services/stt.js';
 import { generateWithTools } from '../services/llm.js';
-import { synthesizeSpeech } from '../services/tts.js';
+import { synthesizeSpeech, streamSpeech } from '../services/tts.js';
 import { TOOL_DEFS, executeTool, businessTimeZone } from '../services/tools.js';
 import { sanitizeRules, matchRoutingRule, isValidE164 } from '../services/routing.js';
 import { telnyxTransfer } from '../services/telnyx.js';
@@ -344,9 +344,7 @@ export class CallSession {
       const aiDisclosureRequired = this.agentConfig?.require_ai_disclosure !== false;
       const greetingText = buildGreeting(this.agentConfig, this.voiceSettingsGreeting, recordingEnabled, aiDisclosureRequired);
       console.log(`[Stream] Synthesizing greeting: "${greetingText}"`);
-      const greetingAudio = await synthesizeSpeech(this.env, greetingText, this.voiceId);
-      console.log('[Stream] Greeting audio received, sending to caller');
-      this.sendAudioToCaller(greetingAudio);
+      await this.speak(greetingText);
       console.log('[Stream] Greeting sent');
     } catch (err) {
       console.error('[Stream] Greeting error:', err.message, err.stack);
@@ -430,9 +428,8 @@ export class CallSession {
       this.pushAssistant(aiText);
 
       const ttsStart = Date.now();
-      const audioResponse = await synthesizeSpeech(this.env, aiText, this.voiceId);
+      await this.speak(aiText);
       t.tts += Date.now() - ttsStart;
-      this.sendAudioToCaller(audioResponse);
 
       console.log(`[Timing] Turn: ${Date.now() - turnStart}ms | llm ${t.llm}ms (${t.rounds} call${t.rounds === 1 ? '' : 's'}) | tts ${t.tts}ms | tools ${t.tools}ms | promptMsgs ${working.length}`);
 
@@ -460,8 +457,12 @@ export class CallSession {
 
   async speakFiller(text) {
     this.pushAssistant(text);
-    const audio = await synthesizeSpeech(this.env, text, this.voiceId);
-    this.sendAudioToCaller(audio);
+    await this.speak(text);
+  }
+
+  // Speak text to the caller, streaming audio as it is generated.
+  async speak(text) {
+    await streamSpeech(this.env, text, this.voiceId, (chunk) => this.sendAudioToCaller(chunk));
   }
 
   // Context the model needs this turn but that doesn't belong in the saved
@@ -549,8 +550,7 @@ export class CallSession {
       const sys = this.messages[0];
       this.messages = [sys, ...this.messages.slice(-20)];
     }
-    const audio = await synthesizeSpeech(this.env, text, this.voiceId);
-    this.sendAudioToCaller(audio);
+    await this.speak(text);
   }
 
   // Returns true if the rule fully handled the turn, false to fall through
@@ -635,10 +635,20 @@ export class CallSession {
       `You are an AI ${position}${nickname} for ${orgName}.`,
       '',
       'Rules — this is a phone call:',
-      '- Maximum 2 sentences per response, no exceptions',
+      '- Maximum 2 sentences per response, no exceptions. One short sentence is often better.',
       '- No bullet points, lists, or markdown ever',
-      '- Speak naturally and conversationally, like a real person in your role',
       '- If unsure, offer to take a message',
+      '',
+      'Sound like a real person on the phone, not an assistant:',
+      '- Use contractions and plain everyday words. Short, natural rhythm. Never sound scripted or corporate.',
+      '- React to what they just said before you ask anything, in a way that fits it (for example "oh no, that sounds painful" or "okay, got it" or "hm, that is odd"). Vary your openers; never start two replies the same way.',
+      '- Banned phrases: "I\'m here to help", "How may I assist", "Certainly", "Absolutely" (more than rarely), "I understand your concern", "Feel free to", "Is there anything else I can help with" after every answer, "As an AI", and calling yourself a virtual assistant or receptionist after the greeting. Do not stack exclamation marks.',
+      '- Match their energy and pace. If they are brief, be brief. If they are chatty or upset, slow down and be warmer.',
+      '- Do not repeat their words back, do not summarise, do not list options. Answer what was asked, then stop. Not every reply needs a question.',
+      '- Use their name rarely, at most once or twice in a whole call.',
+      '- A light human touch is fine, such as "hm", "oh", "well", "right" now and then, but never forced.',
+      '- If you do not know something, say so plainly and offer to have someone follow up.',
+      '- You are an AI and the greeting already said so. Never pretend to be human, and if someone sincerely asks whether you are a person, tell them the truth in one calm sentence and carry on.',
     ];
 
     if (cfg.business_hours) lines.push(`- Business hours (they only limit which appointment times you may offer): ${cfg.business_hours}`);

@@ -75,4 +75,73 @@ async function synthesizeTelnyx(env, text) {
   };
 }
 
-export { synthesizeSpeech };
+
+// Streams Cartesia audio to `onChunk` as it is generated instead of waiting
+// for the whole clip, so the caller hears the first words ~0.5s sooner.
+// Raw mu-law is 1 byte per sample, so any chunk boundary is safe. Returns
+// total bytes sent. Falls back to the buffered path for non-Cartesia TTS.
+async function streamSpeech(env, text, voiceId, onChunk) {
+  if (!text || text.trim().length === 0) return 0;
+  const provider = env.TTS_PROVIDER || 'cartesia';
+  if (provider !== 'cartesia') {
+    const audio = await synthesizeSpeech(env, text, voiceId);
+    if (audio) onChunk(audio);
+    return audio?.length || 0;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
+  try {
+    const res = await fetch('https://api.cartesia.ai/tts/bytes', {
+      method: 'POST',
+      headers: {
+        'X-API-Key': env.CARTESIA_API_KEY,
+        'Cartesia-Version': '2026-03-01',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model_id: env.CARTESIA_MODEL_ID || 'sonic-3',
+        transcript: text,
+        voice: {
+          mode: 'id',
+          id: voiceId || env.CARTESIA_VOICE_ID_DEFAULT || env.CARTESIA_VOICE_ID || 'e07c00bc-4134-4eae-9ea4-1a55fb45746b',
+        },
+        output_format: { container: 'raw', encoding: 'pcm_mulaw', sample_rate: 8000 },
+        language: 'en',
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok || !res.body) {
+      const errText = await res.text().catch(() => '');
+      console.error('[TTS] Cartesia stream error body:', errText);
+      throw new Error(`Cartesia TTS failed: ${res.status}`);
+    }
+
+    const reader = res.body.getReader();
+    let total = 0;
+    let first = true;
+    const t0 = Date.now();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value && value.length) {
+        if (first) {
+          console.log(`[TTS] first audio chunk after ${Date.now() - t0}ms`);
+          first = false;
+        }
+        total += value.length;
+        onChunk(value);
+      }
+    }
+    console.log(`[TTS] Cartesia streamed ${total} bytes in ${Date.now() - t0}ms`);
+    return total;
+  } catch (err) {
+    console.error('[TTS] Cartesia stream error:', err.message);
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export { synthesizeSpeech, streamSpeech };
