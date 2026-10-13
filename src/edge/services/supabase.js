@@ -386,7 +386,7 @@ async function getSystemVoiceDefaults(env, systemType) {
   try {
     const { data, error } = await supabase
       .from('systems_catalog')
-      .select('default_temperature, tone_directive')
+      .select('default_temperature, tone_directive, voice_id')
       .eq('id', systemType)
       .maybeSingle();
 

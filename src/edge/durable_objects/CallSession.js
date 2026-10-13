@@ -277,6 +277,15 @@ export class CallSession {
         : 0.7);
     this.toneDirective = systemVoiceDefaults?.tone_directive || null;
 
+    // Voice resolution: a previewed system always uses its own vertical voice.
+    // On a normal call, an account that explicitly picked a voice keeps it;
+    // otherwise (still on the platform default) the account's system voice applies.
+    const PLATFORM_DEFAULT_VOICE = this.env.CARTESIA_VOICE_ID_DEFAULT || 'e07c00bc-4134-4eae-9ea4-1a55fb45746b';
+    const systemVoice = systemVoiceDefaults?.voice_id || null;
+    const accountPickedVoice = voiceSettings.preferred_voice_id && voiceSettings.preferred_voice_id !== PLATFORM_DEFAULT_VOICE && voiceSettings.preferred_voice_id !== 'e07c00bc-4134-4eae-9ea4-1a55fb45746b';
+    if (this.systemTypeOverride) this.voiceId = systemVoice || this.voiceId;
+    else if (!accountPickedVoice && systemVoice) this.voiceId = systemVoice;
+
     this.remainingMinutesAtStart = await getRemainingMinutes(this.env, this.userId);
 
     this.messages = [
