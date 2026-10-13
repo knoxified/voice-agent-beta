@@ -32,7 +32,7 @@ const DEEPGRAM_LIVE_URL =
  * @param {(err: Error) => void} onError
  * @returns {Promise<WebSocket>} the open Deepgram WebSocket
  */
-async function createLiveTranscription(env, onTranscript, onError) {
+async function createLiveTranscription(env, onTranscript, onError, onActivity) {
   const res = await fetch(DEEPGRAM_LIVE_URL, {
     headers: {
       Upgrade: 'websocket',
@@ -62,6 +62,7 @@ async function createLiveTranscription(env, onTranscript, onError) {
       const speechFinal = data.speech_final;
 
       if (!transcript || transcript.trim().length === 0) return;
+      if (onActivity) onActivity(); // caller is audibly speaking (interim or final)
 
       if (isFinal) {
         lastInterimTranscript = transcript;

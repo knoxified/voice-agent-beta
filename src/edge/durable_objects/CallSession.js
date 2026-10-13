@@ -1,8 +1,7 @@
 import { createLiveTranscription, sendAudio as sendToDeepgram, keepAlive } from '../services/stt.js';
-import { generateResponse } from '../services/llm.js';
+import { generateWithTools } from '../services/llm.js';
 import { synthesizeSpeech } from '../services/tts.js';
-import { detectIntent, buildN8nPayload } from '../services/intent.js';
-import { triggerAutomation } from '../services/n8n.js';
+import { TOOL_DEFS, executeTool, businessTimeZone } from '../services/tools.js';
 import { sanitizeRules, matchRoutingRule, isValidE164 } from '../services/routing.js';
 import { telnyxTransfer } from '../services/telnyx.js';
 import {
@@ -50,6 +49,22 @@ export class CallSession {
     this.minuteWarningPlayed = false;
     this.quotaExceededMessage = null;
     this.voiceId = null;
+
+    // Booking / tool state (see services/tools.js)
+    this.availabilityChecks = 0;
+    this.availabilityNotes = [];
+    this.bookingsMade = 0;
+    this.bookingConfirmed = null;
+    this.callerTurns = 0;
+
+    // Silence handling: ask "still there?" after SILENCE_PROMPT, hang up
+    // SILENCE_HANGUP after that if the caller still hasn't spoken.
+    this.silenceTimer = null;
+    this.silenceStage = 0; // 0 listening, 1 asked "still there?", 2 ending
+    this.silenceBusy = false;
+    this.lastCallerActivityAt = Date.now();
+    this.agentSpeakingUntil = 0;
+    this.ending = false;
   }
 
   async fetch(request) {
@@ -307,7 +322,8 @@ export class CallSession {
           await this.processTurn(transcript);
           this.isProcessing = false;
         },
-        (err) => console.error('[STT] Connection error:', err.message || err)
+        (err) => console.error('[STT] Connection error:', err.message || err),
+        () => this.markCallerActivity()
       );
       console.log('[Stream] Deepgram WebSocket connected');
     } catch (err) {
@@ -335,6 +351,9 @@ export class CallSession {
     } catch (err) {
       console.error('[Stream] Greeting error:', err.message, err.stack);
     }
+
+    this.lastCallerActivityAt = Date.now();
+    this.startSilenceMonitor();
   }
 
   async processTurn(transcript) {
@@ -345,43 +364,62 @@ export class CallSession {
     // arriving from the STT stream so the agent doesn't talk over it.
     if (this.transferInProgress) return;
 
+    this.markCallerActivity();
+
     try {
       this.messages.push({ role: 'user', content: transcript });
+      this.callerTurns += 1;
 
-      const intent = detectIntent(transcript);
+      // Owner-defined routing rules are an optional override layer.
+      // Returns true when the rule fully handled this turn.
+      const rule = matchRoutingRule(this.routingRules, transcript);
+      if (rule && (await this.handleRoutingRule(rule))) return;
 
-      // Owner-defined routing rules are an optional override layer. They only
-      // get a say when the system's own intents (booking, availability...)
-      // did NOT match, so a system never depends on -- or gets hijacked by --
-      // a rule. Returns true when the rule fully handled this turn.
-      if (!intent) {
-        const rule = matchRoutingRule(this.routingRules, transcript);
-        if (rule && (await this.handleRoutingRule(rule))) return;
+      // Per-turn context (call-length nudges, availability already looked up)
+      // is injected here, never stored in this.messages, so the saved
+      // transcript stays clean.
+      const working = [...this.messages, ...this.buildDynamicHints()];
+
+      const MAX_TOOL_ROUNDS = 2;
+      let aiText = null;
+      let usedTool = false;
+
+      for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+        const result = await generateWithTools(
+          this.env,
+          working,
+          this.resolvedTemperature,
+          round < MAX_TOOL_ROUNDS ? TOOL_DEFS : null
+        );
+
+        if (result.toolCalls) {
+          usedTool = true;
+          working.push(result.assistantMessage);
+
+          // Speak a short filler FIRST so there is no dead air while the
+          // calendar / booking webhook runs.
+          const first = result.toolCalls[0].function?.name;
+          await this.speakFiller(result.content || pickFiller(first));
+
+          for (const call of result.toolCalls) {
+            const out = await executeTool(this, call);
+            console.log(`[Tool] ${call.function?.name} ->`, JSON.stringify(out));
+            working.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(out) });
+          }
+          continue;
+        }
+
+        aiText = result.content;
+        break;
       }
-      let automationResult = null;
-      if (intent) {
-        console.log(`[Intent] ${intent.type}`);
-        const payload = buildN8nPayload(intent, { ...this, callerNumber: this.callerNumber }, transcript);
-        automationResult = await triggerAutomation(this.env, intent.type, payload);
-      }
 
-      const llmMessages = automationResult
-        ? [...this.messages, {
-            role: 'system',
-            content: `Automation result: ${JSON.stringify(automationResult)}. Use naturally.`,
-          }]
-        : this.messages;
-
-      const aiText = await generateResponse(this.env, llmMessages, this.resolvedTemperature);
       console.log(`[LLM] "${aiText}"`);
-
-      if (!aiText) return;
-
-      this.messages.push({ role: 'assistant', content: aiText });
-      if (this.messages.length > 22) {
-        const sys = this.messages[0];
-        this.messages = [sys, ...this.messages.slice(-20)];
+      if (!aiText) {
+        if (usedTool) aiText = 'Sorry about that, could you say that once more for me?';
+        else return;
       }
+
+      this.pushAssistant(aiText);
 
       const audioResponse = await synthesizeSpeech(this.env, aiText, this.voiceId);
       this.sendAudioToCaller(audioResponse);
@@ -398,6 +436,98 @@ export class CallSession {
         this.sendAudioToCaller(fallback);
       } catch {
         /* silent */
+      }
+    }
+  }
+
+  pushAssistant(text) {
+    this.messages.push({ role: 'assistant', content: text });
+    if (this.messages.length > 22) {
+      const sys = this.messages[0];
+      this.messages = [sys, ...this.messages.slice(-20)];
+    }
+  }
+
+  async speakFiller(text) {
+    this.pushAssistant(text);
+    const audio = await synthesizeSpeech(this.env, text, this.voiceId);
+    this.sendAudioToCaller(audio);
+  }
+
+  // Context the model needs this turn but that doesn't belong in the saved
+  // transcript: how long the call has run, and facts learned from tools.
+  buildDynamicHints() {
+    const hints = [];
+    const elapsedSecs = this.callStartedAt ? (Date.now() - this.callStartedAt) / 1000 : 0;
+    const softTurns = Number(this.env.CALL_SOFT_TURNS || 5);
+    const firmTurns = Number(this.env.CALL_FIRM_TURNS || 9);
+    const softSecs = Number(this.env.CALL_SOFT_SECONDS || 150);
+    const firmSecs = Number(this.env.CALL_FIRM_SECONDS || 270);
+
+    if (this.bookingConfirmed) {
+      const b = this.bookingConfirmed;
+      hints.push(`A booking is already confirmed on this call (${b.name}, ${b.date} at ${b.time}). Do not book again. Confirm it warmly in one sentence, ask if there is anything else, and close the call naturally.`);
+    } else if (this.callerTurns >= firmTurns || elapsedSecs >= firmSecs) {
+      hints.push('The call has gone on long without a clear next step. Wrap up now: offer to take a message, have the team follow up, or send information, then close warmly. Do not start new topics.');
+    } else if (this.callerTurns >= softTurns || elapsedSecs >= softSecs) {
+      hints.push('You have talked a while. If the caller has a real, specific need you can help with, make your soft next-step suggestion now. If not, start steering toward taking a message or closing politely.');
+    }
+
+    if (this.availabilityNotes.length) {
+      const lines = this.availabilityNotes.map((n) => `${n.date}: ${n.summary}`).join(' | ');
+      hints.push(`Availability already looked up on this call (use it, do not re-check unless the caller changes the day): ${lines}`);
+    }
+
+    return hints.map((content) => ({ role: 'system', content }));
+  }
+
+  // ---- silence handling ------------------------------------------------------
+
+  markCallerActivity() {
+    this.lastCallerActivityAt = Date.now();
+    this.silenceStage = 0;
+  }
+
+  startSilenceMonitor() {
+    if (this.silenceTimer) return;
+    this.silenceTimer = setInterval(() => {
+      this.checkSilence().catch((err) => console.error('[Silence] check error:', err.message));
+    }, 1000);
+  }
+
+  async checkSilence() {
+    if (!this.callStartedAt || this.ending || this.silenceBusy) return;
+    if (this.isProcessing || this.transferInProgress) return;
+
+    const promptMs = Number(this.env.SILENCE_PROMPT_SECONDS || 15) * 1000;
+    const hangupMs = Number(this.env.SILENCE_HANGUP_SECONDS || 10) * 1000;
+
+    // Quiet time only counts once the agent has finished speaking.
+    const quietSince = Math.max(this.lastCallerActivityAt, this.agentSpeakingUntil);
+    const quietFor = Date.now() - quietSince;
+
+    if (this.silenceStage === 0 && quietFor >= promptMs) {
+      this.silenceBusy = true;
+      this.silenceStage = 1;
+      try {
+        await this.speakLine(pickRandom(STILL_THERE_LINES));
+      } finally {
+        this.silenceBusy = false;
+      }
+      return;
+    }
+
+    if (this.silenceStage === 1 && quietFor >= hangupMs) {
+      this.silenceBusy = true;
+      this.silenceStage = 2;
+      this.ending = true;
+      try {
+        await this.speakLine(pickRandom(SILENCE_GOODBYE_LINES));
+        const waitMs = Math.max(0, this.agentSpeakingUntil - Date.now()) + 700;
+        await new Promise((r) => setTimeout(r, waitMs));
+        await this.endCall();
+      } finally {
+        this.silenceBusy = false;
       }
     }
   }
@@ -471,6 +601,9 @@ export class CallSession {
     if (!audioBytes || this.ws.readyState !== 1) return;
     if (audioBytes.__telnyxNativeTTS) return;
 
+    const playMs = (audioBytes.length / 8000) * 1000;
+    this.agentSpeakingUntil = Math.max(Date.now(), this.agentSpeakingUntil) + playMs;
+
     const sidKey = (this.provider === 'twilio' || this.provider === 'web' || this.provider === 'browser') ? 'streamSid' : 'stream_sid';
     this.ws.send(
       JSON.stringify({
@@ -487,20 +620,36 @@ export class CallSession {
     const nickname = cfg.agent_nickname ? ` named ${cfg.agent_nickname}` : '';
     const position = cfg.agent_position || voiceSettings.agent_persona || 'receptionist';
 
+    const tz = businessTimeZone(this);
     const lines = [
       `You are an AI ${position}${nickname} for ${orgName}.`,
       '',
       'Rules — this is a phone call:',
       '- Maximum 2 sentences per response, no exceptions',
       '- No bullet points, lists, or markdown ever',
-      '- Speak naturally and conversationally',
-      '- For appointments: collect name, date, time, reason',
+      '- Speak naturally and conversationally, like a real person in your role',
       '- If unsure, offer to take a message',
     ];
 
     if (cfg.business_hours) lines.push(`- Business hours: ${cfg.business_hours}`);
     if (cfg.business_location) lines.push(`- Location: ${cfg.business_location}`);
-    if (cfg.main_call_to_action) lines.push(`- Primary goal for callers: ${cfg.main_call_to_action}`);
+
+    // The agent always has a quiet objective, so minutes are never burned on
+    // aimless chat, but it must never feel like a sales push.
+    lines.push(
+      '',
+      'How to run the call:',
+      '- First understand why they called. Let them talk, react to what they actually say, and ask one natural follow-up question at a time.',
+      '- Quietly judge two things as you go: is this a real, specific need we can help with, and are they ready for a next step.',
+      '- Never announce, pitch, or mention booking an appointment on your own. Do not ask for a date or time before the caller is qualified.',
+      '- Once they are qualified, offer the next step softly in the way a person in your role would (for example suggesting they come in or have the team take a look). Only if they agree do you move to details.',
+      '- If they are interested but not ready, offer to take a message or send information. If it is not a fit, or the call is going nowhere, wrap up warmly.',
+      '- Booking tools: use check_availability only after they agreed to a next step and you know roughly which day. Use book_appointment only when you have their full name, a valid email, and a specific day and time that they confirmed. Never promise a booking until the tool confirms it.',
+      '- Only offer times inside the business hours above. Say things like "give me a moment" naturally while a tool runs.',
+    );
+    if (cfg.main_call_to_action) {
+      lines.push(`- The outcome that makes a call successful for this business: ${cfg.main_call_to_action}. Work toward it only through the steps above, never by pushing.`);
+    }
 
     // Tone directive is HOW to speak (pace, warmth, formality), kept
     // distinct from systemPrompts below which is WHAT the business does --
@@ -535,7 +684,7 @@ export class CallSession {
       lines.push('', cfg.custom_system_prompt);
     }
 
-    lines.push('', `Today: ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}.`);
+    lines.push('', `Today: ${new Date().toLocaleDateString('en-US', { timeZone: tz, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}. Current local time for the business (${tz}): ${new Date().toLocaleTimeString('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' })}. Dates you pass to tools are in this timezone.`);
 
     return lines.join('\n');
   }
@@ -546,6 +695,7 @@ export class CallSession {
   }
 
   async endCall() {
+    this.ending = true;
     this.cleanup();
 
     if (!this.callId || !this.callStartedAt) return;
@@ -588,6 +738,10 @@ export class CallSession {
   }
 
   cleanup() {
+    if (this.silenceTimer) {
+      clearInterval(this.silenceTimer);
+      this.silenceTimer = null;
+    }
     if (this.keepAliveTimer) {
       clearInterval(this.keepAliveTimer);
       this.keepAliveTimer = null;
@@ -614,4 +768,28 @@ function bytesToBase64(bytes) {
   let binary = '';
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
   return btoa(binary);
+}
+
+const STILL_THERE_LINES = [
+  'Hello? Are you still there?',
+  'Are you still with me?',
+  'Hi, are you still there?',
+];
+
+const SILENCE_GOODBYE_LINES = [
+  "I'm not hearing anything, so I'll let you go. Feel free to call back anytime. Goodbye!",
+  "It seems we got disconnected, so I'll end the call for now. Call back whenever you like. Goodbye!",
+];
+
+const FILLERS = {
+  check_availability: ['Let me check that for you.', 'One moment while I look at the calendar.', 'Give me just a second to check.'],
+  book_appointment: ['Give me a moment while I get that set up.', 'One moment, I am booking that for you now.', 'Bear with me a second while I lock that in.'],
+};
+
+function pickRandom(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function pickFiller(toolName) {
+  return pickRandom(FILLERS[toolName] || ['One moment.']);
 }

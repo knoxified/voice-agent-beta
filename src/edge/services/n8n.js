@@ -1,4 +1,4 @@
-const TIMEOUT_MS = 8000; // n8n must respond within 8 seconds during a call
+const TIMEOUT_MS = 12000; // booking can include an OAuth refresh; the agent speaks a filler line while waiting
 
 function webhookMap(env) {
   return {
