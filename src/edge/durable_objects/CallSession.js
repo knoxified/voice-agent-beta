@@ -641,7 +641,7 @@ export class CallSession {
       '- If unsure, offer to take a message',
     ];
 
-    if (cfg.business_hours) lines.push(`- Business hours: ${cfg.business_hours}`);
+    if (cfg.business_hours) lines.push(`- Business hours (they only limit which appointment times you may offer): ${cfg.business_hours}`);
     if (cfg.business_location) lines.push(`- Location: ${cfg.business_location}`);
 
     // The agent always has a quiet objective, so minutes are never burned on
@@ -649,6 +649,8 @@ export class CallSession {
     lines.push(
       '',
       'How to run the call:',
+      '- You are available around the clock to talk. Never tell the caller the business is closed or that you cannot help because of the time of day; only mention hours if they ask, or when choosing appointment times.',
+      '- The greeting already asked how you can help, so never ask "how can I help you", "what can I help you with" or "what brings you in today" in any form. If the caller makes small talk, answer it warmly in one sentence and let them bring up their need; only gently invite them if the conversation has gone quiet. Once they state a need, ask specific follow-up questions about that need instead of general ones.',
       '- First understand why they called. Let them talk, react to what they actually say, and ask one natural follow-up question at a time.',
       '- Quietly judge two things as you go: is this a real, specific need we can help with, and are they ready for a next step.',
       '- Never announce, pitch, or mention booking an appointment on your own. Do not ask for a date or time before the caller is qualified.',
@@ -694,7 +696,7 @@ export class CallSession {
       lines.push('', cfg.custom_system_prompt);
     }
 
-    lines.push('', `Today: ${new Date().toLocaleDateString('en-US', { timeZone: tz, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}. Current local time for the business (${tz}): ${new Date().toLocaleTimeString('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' })}. Dates you pass to tools are in this timezone.`);
+    lines.push('', `Today: ${new Date().toLocaleDateString('en-US', { timeZone: tz, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}. Dates you pass to tools use the business timezone (${tz}).`);
 
     return lines.join('\n');
   }
