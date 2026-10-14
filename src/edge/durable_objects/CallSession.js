@@ -459,6 +459,7 @@ export class CallSession {
 
       // End-of-call: the model appends [END] to its final goodbye; as a safety
       // net also end when the caller closed AND the agent said a farewell.
+      aiText = dedupeRepeat(aiText);
       let endAfter = /\[END\]/i.test(aiText);
       aiText = aiText.replace(/\s*\[END\]\s*/gi, ' ').trim();
       if (!endAfter && FAREWELL_RE.test(aiText) && CALLER_CLOSING_RE.test(transcript)) endAfter = true;
@@ -741,6 +742,7 @@ export class CallSession {
       '- Maximum 2 sentences per response, no exceptions. One short sentence is often better.',
       '- No bullet points, lists, or markdown ever',
       '- If unsure, offer to take a message',
+      '- Never say you will book, schedule, "pencil in", email, text or send anything yourself unless a tool has confirmed it. Without that, the most you can promise is that the team will follow up.',
       '',
       'Sound like a real person on the phone, not an assistant:',
       '- Use contractions and plain everyday words. Short, natural rhythm. Never sound scripted or corporate.',
@@ -918,3 +920,16 @@ function pickFiller(toolName) {
 
 const FAREWELL_RE = /\b(take care|goodbye|good bye|bye|have a (great|good|nice|wonderful|lovely) (day|one|evening|night|week)|talk (to you )?soon|speak soon)\b/i;
 const CALLER_CLOSING_RE = /\b(bye|goodbye|that'?s (all|it)|nothing else|no,? (thanks|thank you)|(ok(ay)?|alright|great|perfect|cool|sure)[.,!\s]+thank(s| you)|thank(s| you)[.,!\s]+(bye|that'?s all))\b/i;
+
+// gpt-oss occasionally returns its reply twice back to back; speak it once.
+function dedupeRepeat(text) {
+  const t = String(text || '').trim();
+  const n = t.length;
+  if (n < 20) return t;
+  for (const cut of [Math.floor(n / 2), Math.ceil(n / 2)]) {
+    const a = t.slice(0, cut).trim();
+    const b = t.slice(cut).trim();
+    if (a && a === b) return a;
+  }
+  return t;
+}

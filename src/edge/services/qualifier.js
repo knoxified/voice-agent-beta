@@ -31,23 +31,31 @@ export async function classifyStage(env, messages, { businessName } = {}) {
   if (!convo) return null;
 
   const groq = new Groq({ apiKey: env.GROQ_API_KEY });
-  const model = env.GROQ_CLASSIFIER_MODEL || 'llama-3.1-8b-instant';
+  // Same brain as the conversation by default: it is the one model we know is
+  // live on this account. Override with GROQ_CLASSIFIER_MODEL if you add a faster one.
+  const model = env.GROQ_CLASSIFIER_MODEL || env.GROQ_MODEL || 'openai/gpt-oss-20b';
+  const reasoning = /gpt-oss|qwen3|deepseek-r1/i.test(model);
 
-  const call = groq.chat.completions.create({
+  const params = {
     model,
     messages: [
       { role: 'system', content: SYSTEM },
       { role: 'user', content: `Business: ${businessName || 'a local business'}\n\nConversation:\n${convo}\n\nJSON:` },
     ],
     temperature: 0,
-    max_tokens: 60,
-    response_format: { type: 'json_object' },
-  });
-  const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('classifier timeout')), 5000));
+    // Reasoning models spend tokens thinking before the answer; leave room.
+    max_tokens: reasoning ? 400 : 60,
+  };
+  if (reasoning) params.reasoning_effort = 'low';
+  else params.response_format = { type: 'json_object' };
+
+  const call = groq.chat.completions.create(params);
+  const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('classifier timeout')), 6000));
 
   try {
     const res = await Promise.race([call, timeout]);
-    const parsed = JSON.parse(res.choices[0]?.message?.content || '{}');
+    const text = res.choices[0]?.message?.content || '';
+    const parsed = JSON.parse((text.match(/\{[\s\S]*\}/) || ['{}'])[0]);
     if (!STAGES.has(parsed.stage)) return null;
     return { stage: parsed.stage, reason: String(parsed.reason || '').slice(0, 80) };
   } catch (err) {
