@@ -55,6 +55,7 @@ export class CallSession {
     this.availabilityChecks = 0;
     this.availabilityNotes = [];
     this.availabilitySlots = new Map(); // date -> Set of open slot start times (ms)
+    this.availabilityCache = new Map(); // date -> tool result (never pay twice for a day)
 
     // Conversation stage (see services/qualifier.js). Tools stay hidden until
     // the caller has agreed to a next step.
@@ -456,6 +457,12 @@ export class CallSession {
       aiText = aiText.replace(/\s*\[END\]\s*/gi, ' ').trim();
       if (!endAfter && FAREWELL_RE.test(aiText) && CALLER_CLOSING_RE.test(transcript)) endAfter = true;
       if (!aiText) aiText = 'Take care.';
+      // Don't end the call while a booking the caller agreed to is still unfinished,
+      // unless the caller themselves is clearly saying goodbye.
+      if (endAfter && this.actionUnlocked && !this.bookingConfirmed && !CALLER_CLOSING_RE.test(transcript)) {
+        console.log('[Call] Not ending: booking still in progress');
+        endAfter = false;
+      }
 
       this.pushAssistant(aiText);
 
@@ -562,7 +569,14 @@ export class CallSession {
       } else if (this.stage === 'qualified') {
         hints.push(`Stage: the caller is a genuine fit. If you have not already, make ONE soft next-step suggestion now in your own words, the way a person in your role naturally would (what the business wants from a good call: ${cta}). Do not mention booking systems, calendars or tools, and do not ask for personal details yet. If they answer vaguely, keep helping instead of pushing.`);
       } else if (this.stage === 'agreed') {
-        hints.push('Stage: the caller agreed to a next step. Ask which day suits them, and collect what is still missing (full name, email, phone number if needed). Only after they choose a specific day, use check_availability, offer two or three of the returned times, and once they confirm one and you have all the details, use book_appointment. Say "one moment" naturally while a tool runs. Never claim it is booked until the tool confirms.');
+        hints.push([
+          'Stage: the caller agreed to a next step. Follow this order exactly:',
+          '1) Ask which day suits them, turning words like "Friday" into a date from the Upcoming days list. Do NOT name any specific time yet.',
+          '2) As soon as you have a day, use check_availability, then offer two or three of the returned times. Never state a time that did not come from the tool.',
+          '3) When they choose a time, collect their full name and email. Ask them to spell each letter by letter (say "at" and "dot"). Never ask for a phone number; accept it only if they offer.',
+          '4) Read the name and the email back to them letter by letter (for example K-N-O-X, F-A-V-O-R at gmail dot com) and ask if both are right. Fix anything wrong and read it back again. Do not move on until they say yes.',
+          '5) Only then use book_appointment, with a one-sentence reason for the visit taken from what they told you and details_confirmed true. Say "one moment" naturally first. Never say it is booked until the tool confirms.',
+        ].join('\n'));
       } else if (this.stage === 'declined') {
         hints.push('Stage: the caller does not want a next step right now. Do not push. Offer to take a message or send information if useful, then close warmly.');
       } else if (this.stage === 'not_fit') {
@@ -796,7 +810,7 @@ export class CallSession {
       lines.push('', cfg.custom_system_prompt);
     }
 
-    lines.push('', `Today: ${new Date().toLocaleDateString('en-US', { timeZone: tz, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}. Dates you pass to tools use the business timezone (${tz}).`);
+    lines.push('', `Today: ${new Date().toLocaleDateString('en-US', { timeZone: tz, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}. Dates you pass to tools use the business timezone (${tz}). Upcoming days (use these exact dates, never work out dates yourself): ${upcomingDays(tz)}.`);
 
     return lines.join('\n');
   }
@@ -920,4 +934,18 @@ function dedupeRepeat(text) {
     if (a && a === b) return a;
   }
   return t;
+}
+
+// "Wed 2026-10-14 (today), Thu 2026-10-15 (tomorrow), Fri 2026-10-16, ..." in the
+// business timezone, so the model looks dates up instead of doing day maths.
+function upcomingDays(timeZone, n = 14) {
+  const out = [];
+  const now = Date.now();
+  for (let i = 0; i < n; i++) {
+    const d = new Date(now + i * 86400000);
+    const wd = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(d);
+    const ymd = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+    out.push(`${wd} ${ymd}${i === 0 ? ' (today)' : i === 1 ? ' (tomorrow)' : ''}`);
+  }
+  return out.join(', ');
 }

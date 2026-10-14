@@ -20,7 +20,7 @@ export const TOOL_DEFS = [
       parameters: {
         type: 'object',
         properties: {
-          date: { type: 'string', description: 'The day to check, YYYY-MM-DD, in the business local calendar.' },
+          date: { type: 'string', description: 'The day to check as YYYY-MM-DD, copied from the "Upcoming days" list in your instructions (never work out dates yourself).' },
           duration_minutes: { type: 'integer', description: 'Length of the appointment in minutes. Default 30.' },
         },
         required: ['date'],
@@ -32,19 +32,20 @@ export const TOOL_DEFS = [
     function: {
       name: 'book_appointment',
       description:
-        'Book the appointment. ONLY call this when ALL are true: the caller is a genuine fit, they have agreed to the next step, they chose a specific day and time, and you have collected their full name, a valid email address and (if you do not already have their number) a phone number. If anything is missing, ask for it naturally instead of calling this.',
+        'Book the appointment. Call this ONLY after ALL of these are true: the caller is a genuine fit and agreed to come in, they chose a time that check_availability returned, you collected their full name and email, and you READ BOTH BACK letter by letter and the caller said yes. If anything is missing, keep collecting it instead of calling this. A phone number is optional and must never be requested.',
       parameters: {
         type: 'object',
         properties: {
-          name: { type: 'string', description: "Caller's full name." },
-          email: { type: 'string', description: "Caller's email address, spelled out exactly as confirmed." },
-          phone: { type: 'string', description: "Caller's phone number. Omit if you already have the number they are calling from." },
-          date: { type: 'string', description: 'Appointment day, YYYY-MM-DD, business local calendar.' },
-          time: { type: 'string', description: 'Appointment start time, 24-hour HH:MM, business local time.' },
+          name: { type: 'string', description: "Caller's full name, exactly as confirmed." },
+          email: { type: 'string', description: "Caller's email address, exactly as confirmed letter by letter." },
+          date: { type: 'string', description: 'Appointment day, YYYY-MM-DD, from the Upcoming days list.' },
+          time: { type: 'string', description: 'Appointment start time, 24-hour HH:MM, one of the times check_availability returned.' },
+          reason: { type: 'string', description: 'One short sentence on the main reason for the call and visit, from what the caller told you (for example "Itchy fluid-filled bumps on hand for about 5 days"). Under 100 characters.' },
+          details_confirmed: { type: 'boolean', description: 'true ONLY if you read the name and email back letter by letter and the caller confirmed they are correct.' },
+          phone: { type: 'string', description: 'Optional. Only if the caller volunteered a number.' },
           duration_minutes: { type: 'integer', description: 'Length in minutes. Default 30.' },
-          reason: { type: 'string', description: 'Short reason for the visit, under 80 characters.' },
         },
-        required: ['name', 'email', 'date', 'time'],
+        required: ['name', 'email', 'date', 'time', 'reason', 'details_confirmed'],
       },
     },
   },
@@ -138,6 +139,8 @@ async function runAvailability(session, args) {
   if (date < todayInZone(tz)) {
     return { ok: false, error: 'date_in_past', instruction: 'That day has passed. Ask for an upcoming day.' };
   }
+  const cached = session.availabilityCache.get(date);
+  if (cached) return cached; // same day already looked up on this call: no extra credit
   if (session.availabilityChecks >= MAX_AVAILABILITY_CHECKS) {
     return { ok: false, error: 'limit_reached', instruction: 'Do not check again. Offer to have the team follow up with times instead.' };
   }
@@ -171,7 +174,7 @@ async function runAvailability(session, args) {
     ? `Open times on ${date} (${tz}): ${labels.join(', ')}`
     : `No openings on ${date}`;
   session.availabilityNotes.push({ date, summary });
-  return {
+  const result = {
     ok: true,
     date,
     timezone: tz,
@@ -181,6 +184,8 @@ async function runAvailability(session, args) {
       ? 'Offer two or three of these times naturally (for example "I have 10 or 2:30"). Never read the whole list.'
       : 'Nothing is open that day. Offer another day.',
   };
+  session.availabilityCache.set(date, result);
+  return result;
 }
 
 async function runBooking(session, args) {
@@ -189,15 +194,24 @@ async function runBooking(session, args) {
   const email = String(args.email || '').trim().toLowerCase();
   const date = String(args.date || '').trim();
   const time = String(args.time || '').trim();
-  const phone = String(args.phone || '').trim() || session.callerNumber || '';
+  const phone = String(args.phone || '').trim() || session.callerNumber || ''; // optional
+  const reasonText = String(args.reason || '').trim();
 
   const missing = [];
   if (name.length < 2) missing.push('full name');
   if (!EMAIL_RE.test(email)) missing.push('a valid email address');
-  if (!phone) missing.push('a phone number');
   if (!isRealDate(date) || !TIME_RE.test(time)) missing.push('a specific day and time');
+  if (reasonText.length < 3) missing.push('the main reason for the visit');
   if (missing.length) {
     return { ok: false, error: 'missing_details', missing, instruction: `Do not book yet. Naturally ask the caller for: ${missing.join(', ')}.` };
+  }
+
+  if (args.details_confirmed !== true) {
+    return {
+      ok: false,
+      error: 'details_not_confirmed',
+      instruction: 'Do not book yet. Read the full name and the email back to the caller letter by letter (for example K-N-O-X, F-A-V-O-R at gmail dot com), ask if both are correct, fix anything wrong, and only call this again once they say yes.',
+    };
   }
 
   if (session.bookingsMade >= MAX_BOOKINGS) {
@@ -224,18 +238,21 @@ async function runBooking(session, args) {
     return { ok: false, error: 'time_not_open', instruction: 'That exact time is not open. Offer one of the open times from the availability result.' };
   }
 
-  const reason = String(args.reason || 'Appointment').trim().slice(0, 80);
-  const res = await triggerAutomation(session.env, 'book_appointment', {
+  const reason = reasonText.slice(0, 100);
+  // provider is added here by code (the caller is never asked); the workflow
+  // resolves the saved calendar connection from it. phone is sent only if known.
+  const payload = {
     userId: session.userId,
     provider: 'google',
     name,
     email,
-    phone,
     startTime: `${date}T${time}:00${offset}`,
     endTime: new Date(instant.getTime() + duration * 60000).toISOString(),
-    notes: `${reason} - ${name}`.slice(0, 120),
+    notes: reason,
     timeZone: tz,
-  });
+  };
+  if (phone) payload.phone = phone;
+  const res = await triggerAutomation(session.env, 'book_appointment', payload);
 
   if (isInsufficientCredits(res)) {
     return { ok: false, error: 'service_unavailable', instruction: 'Booking is not available right now. Take their details and say the team will follow up.' };
