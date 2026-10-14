@@ -29,8 +29,15 @@ async function triggerAutomation(env, intentType, payload) {
       signal: controller.signal,
     });
 
-    const data = await res.json().catch(() => null);
-    console.log(`[n8n] ${intentType} -> HTTP ${res.status}`, JSON.stringify(data)?.slice(0, 300));
+    // Read as text first so an empty / non-JSON reply from n8n is visible in the logs.
+    const raw = await res.text().catch(() => '');
+    let data = null;
+    try {
+      data = raw ? JSON.parse(raw) : null;
+    } catch {
+      /* non-JSON body, logged below */
+    }
+    console.log(`[n8n] ${intentType} -> HTTP ${res.status} | body: ${raw ? raw.slice(0, 400) : '(empty)'}`);
     return data;
   } catch (err) {
     // Don't crash the call if n8n fails -- the AI handles it gracefully.
