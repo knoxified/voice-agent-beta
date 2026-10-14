@@ -150,6 +150,7 @@ async function runAvailability(session, args) {
     tool: 'checkAvailableSlot',
     date,
     duration,
+    timeZone: tz,
   });
 
   if (isInsufficientCredits(res)) {
@@ -159,9 +160,27 @@ async function runAvailability(session, args) {
     return { ok: false, error: 'lookup_failed', instruction: 'You could not reach the calendar. Offer to take a message so the team can follow up.' };
   }
 
-  const summary = String(res.summary || '');
+  // Build the spoken times ourselves from the real slot instants, in the
+  // business timezone. n8n's own text summary is not trusted for display.
+  const starts = (Array.isArray(res.freeSlots) ? res.freeSlots : [])
+    .map((sl) => Date.parse(sl.start))
+    .filter(Number.isFinite);
+  session.availabilitySlots.set(date, new Set(starts));
+  const labels = spreadLabels(starts, tz, 6);
+  const summary = starts.length
+    ? `Open times on ${date} (${tz}): ${labels.join(', ')}`
+    : `No openings on ${date}`;
   session.availabilityNotes.push({ date, summary });
-  return { ok: true, date, summary, hasOpenings: Array.isArray(res.freeSlots) && res.freeSlots.length > 0 };
+  return {
+    ok: true,
+    date,
+    timezone: tz,
+    openTimes: labels,
+    hasOpenings: starts.length > 0,
+    instruction: starts.length
+      ? 'Offer two or three of these times naturally (for example "I have 10 or 2:30"). Never read the whole list.'
+      : 'Nothing is open that day. Offer another day.',
+  };
 }
 
 async function runBooking(session, args) {
@@ -195,6 +214,16 @@ async function runBooking(session, args) {
     return { ok: false, error: 'too_far_ahead', instruction: 'That is too far ahead to book. Ask for a nearer date.' };
   }
 
+  // The caller must be booked into a time that was really open: availability
+  // for that day must have been checked, and the exact slot must be in it.
+  const openSlots = session.availabilitySlots.get(date);
+  if (!openSlots) {
+    return { ok: false, error: 'availability_not_checked', instruction: 'Check availability for that day with check_availability first, then offer real open times.' };
+  }
+  if (!openSlots.has(instant.getTime())) {
+    return { ok: false, error: 'time_not_open', instruction: 'That exact time is not open. Offer one of the open times from the availability result.' };
+  }
+
   const reason = String(args.reason || 'Appointment').trim().slice(0, 80);
   const res = await triggerAutomation(session.env, 'book_appointment', {
     userId: session.userId,
@@ -205,6 +234,7 @@ async function runBooking(session, args) {
     startTime: `${date}T${time}:00${offset}`,
     endTime: new Date(instant.getTime() + duration * 60000).toISOString(),
     notes: `${reason} - ${name}`.slice(0, 120),
+    timeZone: tz,
   });
 
   if (isInsufficientCredits(res)) {
@@ -219,4 +249,16 @@ async function runBooking(session, args) {
     return { ok: true, booked: true, name, date, time, duration_minutes: duration };
   }
   return { ok: false, error: 'booking_failed', instruction: 'The booking did not go through. Do not claim it did. Take their details and say the team will follow up.' };
+}
+
+// Up to `max` evenly spread local clock labels ("10:00 AM") from slot starts.
+function spreadLabels(starts, timeZone, max) {
+  if (!starts.length) return [];
+  const sorted = [...new Set(starts)].sort((a, b) => a - b);
+  const pick = [];
+  if (sorted.length <= max) pick.push(...sorted);
+  else for (let i = 0; i < max; i++) pick.push(sorted[Math.round((i * (sorted.length - 1)) / (max - 1))]);
+  return pick.map((ms) =>
+    new Intl.DateTimeFormat('en-US', { timeZone, hour: 'numeric', minute: '2-digit' }).format(new Date(ms))
+  );
 }

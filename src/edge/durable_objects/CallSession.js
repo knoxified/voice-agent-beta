@@ -2,6 +2,7 @@ import { createLiveTranscription, sendAudio as sendToDeepgram, keepAlive } from 
 import { generateWithTools } from '../services/llm.js';
 import { synthesizeSpeech, streamSpeech } from '../services/tts.js';
 import { TOOL_DEFS, executeTool, businessTimeZone } from '../services/tools.js';
+import { classifyStage } from '../services/qualifier.js';
 import { sanitizeRules, matchRoutingRule, isValidE164 } from '../services/routing.js';
 import { telnyxTransfer, telnyxHangup } from '../services/telnyx.js';
 import {
@@ -53,6 +54,13 @@ export class CallSession {
     // Booking / tool state (see services/tools.js)
     this.availabilityChecks = 0;
     this.availabilityNotes = [];
+    this.availabilitySlots = new Map(); // date -> Set of open slot start times (ms)
+
+    // Conversation stage (see services/qualifier.js). Tools stay hidden until
+    // the caller has agreed to a next step.
+    this.stage = 'discover';
+    this.actionUnlocked = false;
+    this.queuedTranscript = '';
     this.bookingsMade = 0;
     this.bookingConfirmed = null;
     this.callerTurns = 0;
@@ -325,12 +333,22 @@ export class CallSession {
         async (transcript, isSpeechFinal) => {
           if (!isSpeechFinal) return;
           if (this.isProcessing) {
-            console.log('[Stream] Still processing previous turn, skipping');
+            // Don't drop what the caller said while we were busy; handle it next.
+            this.queuedTranscript = `${this.queuedTranscript} ${transcript}`.trim();
+            console.log('[Stream] Caller spoke while busy, queued');
             return;
           }
           this.isProcessing = true;
-          await this.processTurn(transcript);
-          this.isProcessing = false;
+          try {
+            let next = transcript;
+            while (next && !this.ending) {
+              this.queuedTranscript = '';
+              await this.processTurn(next);
+              next = this.queuedTranscript;
+            }
+          } finally {
+            this.isProcessing = false;
+          }
         },
         (err) => console.error('[STT] Connection error:', err.message || err),
         () => this.markCallerActivity(),
@@ -379,6 +397,9 @@ export class CallSession {
       this.messages.push({ role: 'user', content: transcript });
       this.callerTurns += 1;
 
+      // Judge the conversation stage in parallel with the reply (no added latency).
+      this.updateStage();
+
       // Owner-defined routing rules are an optional override layer.
       // Returns true when the rule fully handled this turn.
       const rule = matchRoutingRule(this.routingRules, transcript);
@@ -400,7 +421,7 @@ export class CallSession {
           this.env,
           working,
           this.resolvedTemperature,
-          round < MAX_TOOL_ROUNDS ? TOOL_DEFS : null
+          round < MAX_TOOL_ROUNDS && this.actionUnlocked ? TOOL_DEFS : null
         );
         t.llm += Date.now() - llmStart;
         t.rounds += 1;
@@ -489,6 +510,22 @@ export class CallSession {
     return out;
   }
 
+  updateStage() {
+    const cfg = this.agentConfig || {};
+    classifyStage(this.env, this.messages, { businessName: cfg.organization_name })
+      .then((r) => {
+        if (!r) return;
+        let stage = r.stage;
+        // Once the caller agreed, later short answers (names, emails) must not re-lock the tools.
+        if (this.actionUnlocked && (stage === 'discover' || stage === 'qualified')) stage = 'agreed';
+        if (stage !== this.stage) console.log(`[Stage] ${this.stage} -> ${stage} (${r.reason})`);
+        this.stage = stage;
+        if (stage === 'agreed') this.actionUnlocked = true;
+        else if (stage === 'declined' || stage === 'not_fit') this.actionUnlocked = false;
+      })
+      .catch(() => {});
+  }
+
   pushAssistant(text) {
     this.messages.push({ role: 'assistant', content: text });
     if (this.messages.length > 22) {
@@ -527,6 +564,21 @@ export class CallSession {
     const firmTurns = Number(this.env.CALL_FIRM_TURNS || 9);
     const softSecs = Number(this.env.CALL_SOFT_SECONDS || 150);
     const firmSecs = Number(this.env.CALL_FIRM_SECONDS || 270);
+
+    const cta = (this.agentConfig?.main_call_to_action || 'a visit or appointment').trim();
+    if (!this.bookingConfirmed) {
+      if (this.stage === 'discover') {
+        hints.push('Stage: still discovering. Do NOT suggest a visit, appointment, call-back or any next step yet. React to what they said and ask one specific follow-up about their situation (what exactly, how long, how bad, what they have already tried).');
+      } else if (this.stage === 'qualified') {
+        hints.push(`Stage: the caller is a genuine fit. If you have not already, make ONE soft next-step suggestion now in your own words, the way a person in your role naturally would (what the business wants from a good call: ${cta}). Do not mention booking systems, calendars or tools, and do not ask for personal details yet. If they answer vaguely, keep helping instead of pushing.`);
+      } else if (this.stage === 'agreed') {
+        hints.push('Stage: the caller agreed to a next step. Ask which day suits them, and collect what is still missing (full name, email, phone number if needed). Only after they choose a specific day, use check_availability, offer two or three of the returned times, and once they confirm one and you have all the details, use book_appointment. Say "one moment" naturally while a tool runs. Never claim it is booked until the tool confirms.');
+      } else if (this.stage === 'declined') {
+        hints.push('Stage: the caller does not want a next step right now. Do not push. Offer to take a message or send information if useful, then close warmly.');
+      } else if (this.stage === 'not_fit') {
+        hints.push('Stage: this does not look like something the business can help with. Be polite, briefly say so, and wrap up.');
+      }
+    }
 
     if (this.bookingConfirmed) {
       const b = this.bookingConfirmed;
@@ -718,12 +770,8 @@ export class CallSession {
       '- Never announce, pitch, or mention booking an appointment on your own. Do not ask for a date or time before the caller is qualified.',
       '- Once they are qualified, offer the next step softly in the way a person in your role would (for example suggesting they come in or have the team take a look). Only if they agree do you move to details.',
       '- If they are interested but not ready, offer to take a message or send information. If it is not a fit, or the call is going nowhere, wrap up warmly.',
-      '- Booking tools: use check_availability only after they agreed to a next step and you know roughly which day. Use book_appointment only when you have their full name, a valid email, and a specific day and time that they confirmed. Never promise a booking until the tool confirms it.',
-      '- Only offer times inside the business hours above. Say things like "give me a moment" naturally while a tool runs.',
+      '- Only offer appointment times inside the business hours above.',
     );
-    if (cfg.main_call_to_action) {
-      lines.push(`- The outcome that makes a call successful for this business: ${cfg.main_call_to_action}. Work toward it only through the steps above, never by pushing.`);
-    }
 
     // Tone directive is HOW to speak (pace, warmth, formality), kept
     // distinct from systemPrompts below which is WHAT the business does --
