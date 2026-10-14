@@ -413,18 +413,14 @@ export class CallSession {
       const MAX_TOOL_ROUNDS = 2;
       let aiText = null;
       let usedTool = false;
-      const t = { llm: 0, tools: 0, tts: 0, rounds: 0 };
 
       for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
-        const llmStart = Date.now();
         const result = await generateWithTools(
           this.env,
           working,
           this.resolvedTemperature,
           round < MAX_TOOL_ROUNDS && this.actionUnlocked ? TOOL_DEFS : null
         );
-        t.llm += Date.now() - llmStart;
-        t.rounds += 1;
 
         if (result.toolCalls) {
           usedTool = true;
@@ -433,14 +429,10 @@ export class CallSession {
           // Speak a short filler FIRST so there is no dead air while the
           // calendar / booking webhook runs.
           const first = result.toolCalls[0].function?.name;
-          const fillStart = Date.now();
           await this.speakFiller(result.content || pickFiller(first));
-          t.tts += Date.now() - fillStart;
 
           for (const call of result.toolCalls) {
-            const toolStart = Date.now();
             const out = await executeTool(this, call);
-            t.tools += Date.now() - toolStart;
             console.log(`[Tool] ${call.function?.name} ->`, JSON.stringify(out));
             working.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(out) });
           }
@@ -467,9 +459,7 @@ export class CallSession {
 
       this.pushAssistant(aiText);
 
-      const ttsStart = Date.now();
       await this.speak(aiText);
-      t.tts += Date.now() - ttsStart;
 
       if (endAfter) {
         console.log('[Call] Ending call after goodbye');
@@ -477,7 +467,6 @@ export class CallSession {
         return;
       }
 
-      console.log(`[Timing] Turn: ${Date.now() - turnStart}ms | llm ${t.llm}ms (${t.rounds} call${t.rounds === 1 ? '' : 's'}) | tts ${t.tts}ms | tools ${t.tools}ms | promptMsgs ${working.length}`);
 
       if (this.isWebCall && this.isTrial) {
         await this.checkTrialQuota();
