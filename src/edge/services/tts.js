@@ -120,16 +120,11 @@ async function streamSpeech(env, text, voiceId, onChunk) {
 
     const reader = res.body.getReader();
     let total = 0;
-    let first = true;
     const t0 = Date.now();
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       if (value && value.length) {
-        if (first) {
-          console.log(`[TTS] first audio chunk after ${Date.now() - t0}ms`);
-          first = false;
-        }
         total += value.length;
         onChunk(value);
       }

@@ -742,7 +742,6 @@ export class CallSession {
       '- Maximum 2 sentences per response, no exceptions. One short sentence is often better.',
       '- No bullet points, lists, or markdown ever',
       '- If unsure, offer to take a message',
-      '- Never say you will book, schedule, "pencil in", email, text or send anything yourself unless a tool has confirmed it. Without that, the most you can promise is that the team will follow up.',
       '',
       'Sound like a real person on the phone, not an assistant:',
       '- Use contractions and plain everyday words. Short, natural rhythm. Never sound scripted or corporate.',
