@@ -68,7 +68,15 @@ async function createLiveTranscription(env, onTranscript, onError, onActivity, o
   }
   ws.accept();
 
-  const debounceMs = Number(env.STT_DEBOUNCE_MS ?? 300);
+  const debounceMs = Number(env.STT_DEBOUNCE_MS ?? 400);
+  // A sentence that trails off ("I noticed a little", "it will") is almost
+  // never the end of the caller's turn, so wait much longer before replying.
+  const incompleteMs = Number(env.STT_INCOMPLETE_MS ?? 1600);
+  const DANGLING = /\b(a|an|the|and|but|or|so|to|of|in|on|at|for|with|my|i|i'm|i've|it|it's|that|is|was|will|would|if|because|like|um|uh|about|from|by|then|also|just|really|kind of|sort of)[\s.,…-]*$/i;
+  const isComplete = (t) => {
+    const x = t.trim();
+    return /[.!?]["')\]]*$/.test(x) && !DANGLING.test(x.replace(/[.!?]+$/, ''));
+  };
   let pending = '';
   let timer = null;
 
@@ -97,7 +105,7 @@ async function createLiveTranscription(env, onTranscript, onError, onActivity, o
       const transcript = data.channel?.alternatives?.[0]?.transcript;
       if (!transcript || transcript.trim().length === 0) return;
 
-      if (onActivity) onActivity(); // caller is audibly speaking (interim or final)
+      if (onActivity) onActivity(transcript); // caller is audibly speaking (interim or final)
 
       // More speech arrived: the caller is still talking, cancel any pending delivery.
       if (timer) {
@@ -110,13 +118,19 @@ async function createLiveTranscription(env, onTranscript, onError, onActivity, o
         console.log(`[STT] Segment: "${transcript}"`);
       }
       if (data.speech_final && pending) {
-        timer = setTimeout(flush, debounceMs);
+        timer = setTimeout(flush, isComplete(pending) ? debounceMs : incompleteMs);
       }
     } else if (data.type === 'UtteranceEnd') {
       // ~1s of silence: deliver whatever has been finalized.
       if (pending.trim().length > 0) {
-        console.log('[STT] UtteranceEnd flush');
-        flush();
+        if (isComplete(pending)) {
+          console.log('[STT] UtteranceEnd flush');
+          flush();
+        } else if (!timer) {
+          // Unfinished sentence: give the caller a little longer to continue.
+          console.log('[STT] UtteranceEnd on unfinished sentence, waiting');
+          timer = setTimeout(flush, Math.max(300, incompleteMs - 1000));
+        }
       }
     }
   });

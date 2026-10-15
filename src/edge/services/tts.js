@@ -80,7 +80,7 @@ async function synthesizeTelnyx(env, text) {
 // for the whole clip, so the caller hears the first words ~0.5s sooner.
 // Raw mu-law is 1 byte per sample, so any chunk boundary is safe. Returns
 // total bytes sent. Falls back to the buffered path for non-Cartesia TTS.
-async function streamSpeech(env, text, voiceId, onChunk) {
+async function streamSpeech(env, text, voiceId, onChunk, shouldStop) {
   if (!text || text.trim().length === 0) return 0;
   const provider = env.TTS_PROVIDER || 'cartesia';
   if (provider !== 'cartesia') {
@@ -122,6 +122,11 @@ async function streamSpeech(env, text, voiceId, onChunk) {
     let total = 0;
     const t0 = Date.now();
     for (;;) {
+      if (shouldStop && shouldStop()) {
+        await reader.cancel().catch(() => {});
+        console.log('[TTS] stopped early (caller barged in)');
+        break;
+      }
       const { done, value } = await reader.read();
       if (done) break;
       if (value && value.length) {

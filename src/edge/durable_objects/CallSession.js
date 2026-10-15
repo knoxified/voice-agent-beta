@@ -3,6 +3,7 @@ import { generateWithTools } from '../services/llm.js';
 import { synthesizeSpeech, streamSpeech } from '../services/tts.js';
 import { TOOL_DEFS, executeTool, businessTimeZone } from '../services/tools.js';
 import { classifyStage } from '../services/qualifier.js';
+import { parseDayMention, parseTimeMention, matchSlot, dayLabel } from '../services/scheduling.js';
 import { sanitizeRules, matchRoutingRule, isValidE164 } from '../services/routing.js';
 import { telnyxTransfer, telnyxHangup } from '../services/telnyx.js';
 import {
@@ -62,6 +63,16 @@ export class CallSession {
     this.stage = 'discover';
     this.actionUnlocked = false;
     this.queuedTranscript = '';
+
+    // Scheduling state, driven by the code (services/scheduling.js), not the model.
+    this.activeDate = null; // day the caller is talking about (YYYY-MM-DD)
+    this.selectedSlot = null; // { date, time: 'HH:MM', label } once the caller picks an open time
+    this.timeNotOpen = null; // label of a time they asked for that is not open (one turn)
+
+    // Barge-in
+    this.speakEpoch = 0;
+    this.speechStartedAt = 0;
+    this.lastInterruptAt = 0;
     this.bookingsMade = 0;
     this.bookingConfirmed = null;
     this.callerTurns = 0;
@@ -352,7 +363,7 @@ export class CallSession {
           }
         },
         (err) => console.error('[STT] Connection error:', err.message || err),
-        () => this.markCallerActivity(),
+        (text) => this.markCallerActivity(text),
         { ...this.sttFormat, keyterms: this.buildKeyterms() }
       );
       console.log('[Stream] Deepgram WebSocket connected');
@@ -399,7 +410,7 @@ export class CallSession {
       this.callerTurns += 1;
 
       // Judge the conversation stage in parallel with the reply (no added latency).
-      this.updateStage();
+      const stagePromise = this.updateStage();
 
       // Owner-defined routing rules are an optional override layer.
       // Returns true when the rule fully handled this turn.
@@ -409,6 +420,14 @@ export class CallSession {
       // Per-turn context (call-length nudges, availability already looked up)
       // is injected here, never stored in this.messages, so the saved
       // transcript stays clean.
+      // The caller naming a day while the judge still says "qualified" means they
+      // agreed: settle the stage first so the calendar is checked this very turn.
+      if (!this.actionUnlocked && !this.bookingConfirmed && (this.stage === 'qualified' || this.stage === 'discover')
+          && parseDayMention(transcript, businessTimeZone(this))) {
+        await stagePromise;
+      }
+      if (this.actionUnlocked && !this.bookingConfirmed) await this.prepareScheduling(transcript);
+
       const working = [...this.messages, ...this.buildDynamicHints()];
 
       const MAX_TOOL_ROUNDS = 2;
@@ -466,7 +485,9 @@ export class CallSession {
 
       this.pushAssistant(aiText);
 
+      const spokeAt = Date.now();
       await this.speak(aiText);
+      if (endAfter && this.lastInterruptAt >= spokeAt) endAfter = false; // they talked over the goodbye
 
       if (endAfter) {
         console.log('[Call] Ending call after goodbye');
@@ -507,9 +528,72 @@ export class CallSession {
     return out;
   }
 
+  // Runs BEFORE the reply when the caller has agreed to a next step. The code,
+  // not the model, resolves the day, checks the calendar once per day, and
+  // locks in the time the caller picks.
+  async prepareScheduling(transcript) {
+    const tz = businessTimeZone(this);
+    this.timeNotOpen = null;
+
+    const day = parseDayMention(transcript, tz);
+    if (day && (day !== this.activeDate || !this.availabilityCache.has(day))) {
+      this.activeDate = day;
+      if (day !== this.selectedSlot?.date) this.selectedSlot = null;
+      if (!this.availabilityCache.has(day)) {
+        await this.speakFiller(pickFiller('check_availability'));
+        const out = await executeTool(this, { id: 'auto', function: { name: 'check_availability', arguments: JSON.stringify({ date: day }) } });
+        console.log(`[Calendar] ${day} ->`, JSON.stringify(out).slice(0, 240));
+      }
+    }
+
+    if (this.activeDate && this.availabilitySlots.has(this.activeDate)) {
+      const parsed = parseTimeMention(transcript);
+      if (parsed) {
+        const m = matchSlot(this.availabilitySlots.get(this.activeDate), parsed, tz);
+        if (m?.time) {
+          this.selectedSlot = { date: this.activeDate, time: m.time, label: m.label };
+          console.log(`[Calendar] locked ${this.activeDate} ${m.time}`);
+        } else if (m?.notOpen) {
+          this.timeNotOpen = m.label;
+          console.log(`[Calendar] ${m.label} is not open on ${this.activeDate}`);
+        }
+      }
+    }
+  }
+
+  agreedHint() {
+    const tz = businessTimeZone(this);
+    const L = ['Stage: the caller agreed to a next step. The calendar is handled for you automatically; never claim to check it yourself.'];
+    if (!this.activeDate) {
+      L.push('1) Ask which day suits them. You have NO calendar information yet, so do not mention any times or openings.');
+      return L.join('\n');
+    }
+    const dl = dayLabel(this.activeDate, tz);
+    const info = this.availabilityCache.get(this.activeDate);
+    if (!info) {
+      L.push(`The calendar for ${dl} could not be checked right now. Do not offer any times. Offer to take their details so the team can follow up.`);
+      return L.join('\n');
+    }
+    if (!info.hasOpenings) {
+      L.push(`There are no openings on ${dl}. Say so briefly and ask for another day.`);
+      return L.join('\n');
+    }
+    if (!this.selectedSlot) {
+      L.push(`2) The calendar for ${dl} is ALREADY checked. Open start times: ${info.openRanges.join('; ')}. Offer two or three that fit what they asked for, naturally (for example "I have 10 or 2:30"). Never name a time outside these ranges.`);
+      if (this.timeNotOpen) L.push(`They asked for ${this.timeNotOpen}, which is NOT open. Say so briefly and offer the nearest open times.`);
+      L.push('Do not ask for their name or email yet.');
+      return L.join('\n');
+    }
+    L.push(`2) LOCKED IN: ${this.selectedSlot.label} on ${dl}. This time is open and final. Do not offer, mention or discuss any other time, and never check the calendar again unless THEY ask for a different day.`);
+    L.push('3) Collect their full name and email. Ask them to spell each letter by letter (say "at" and "dot"). Never ask for a phone number; accept it only if they offer.');
+    L.push('4) Read the name and the email back to them letter by letter (for example K-N-O-X, F-A-V-O-R at gmail dot com) and ask if both are right. Fix anything wrong and read it back again. Do not move on until they say yes.');
+    L.push('5) Only then use book_appointment with a one-sentence reason for the visit taken from what they told you, and details_confirmed true. Say "one moment" naturally first. Never say it is booked until the tool confirms.');
+    return L.join('\n');
+  }
+
   updateStage() {
     const cfg = this.agentConfig || {};
-    classifyStage(this.env, this.messages, { businessName: cfg.organization_name })
+    return classifyStage(this.env, this.messages, { businessName: cfg.organization_name })
       .then((r) => {
         if (!r) return;
         let stage = r.stage;
@@ -549,7 +633,15 @@ export class CallSession {
 
   // Speak text to the caller, streaming audio as it is generated.
   async speak(text) {
-    await streamSpeech(this.env, text, this.voiceId, (chunk) => this.sendAudioToCaller(chunk));
+    const epoch = ++this.speakEpoch;
+    this.speechStartedAt = Date.now();
+    await streamSpeech(
+      this.env,
+      text,
+      this.voiceId,
+      (chunk) => { if (epoch === this.speakEpoch) this.sendAudioToCaller(chunk); },
+      () => epoch !== this.speakEpoch
+    );
   }
 
   // Context the model needs this turn but that doesn't belong in the saved
@@ -569,14 +661,7 @@ export class CallSession {
       } else if (this.stage === 'qualified') {
         hints.push(`Stage: the caller is a genuine fit. If you have not already, make ONE soft next-step suggestion now in your own words, the way a person in your role naturally would (what the business wants from a good call: ${cta}). Do not mention booking systems, calendars or tools, and do not ask for personal details yet. If they answer vaguely, keep helping instead of pushing.`);
       } else if (this.stage === 'agreed') {
-        hints.push([
-          'Stage: the caller agreed to a next step. Follow this order exactly:',
-          '1) Ask which day suits them, turning words like "Friday" into a date from the Upcoming days list. Do NOT name any specific time yet.',
-          '2) As soon as you have a day, use check_availability, then offer two or three of the returned times. Never state a time that did not come from the tool.',
-          '3) When they choose a time, collect their full name and email. Ask them to spell each letter by letter (say "at" and "dot"). Never ask for a phone number; accept it only if they offer.',
-          '4) Read the name and the email back to them letter by letter (for example K-N-O-X, F-A-V-O-R at gmail dot com) and ask if both are right. Fix anything wrong and read it back again. Do not move on until they say yes.',
-          '5) Only then use book_appointment, with a one-sentence reason for the visit taken from what they told you and details_confirmed true. Say "one moment" naturally first. Never say it is booked until the tool confirms.',
-        ].join('\n'));
+        hints.push(this.agreedHint());
       } else if (this.stage === 'declined') {
         hints.push('Stage: the caller does not want a next step right now. Do not push. Offer to take a message or send information if useful, then close warmly.');
       } else if (this.stage === 'not_fit') {
@@ -603,9 +688,30 @@ export class CallSession {
 
   // ---- silence handling ------------------------------------------------------
 
-  markCallerActivity() {
-    this.lastCallerActivityAt = Date.now();
+  markCallerActivity(text = '') {
+    const now = Date.now();
+    this.lastCallerActivityAt = now;
     this.silenceStage = 0;
+    // Barge-in: real speech (2+ words) while the agent is mid-sentence stops the agent.
+    const words = String(text).trim().split(/\s+/).filter(Boolean).length;
+    if (words >= 2 && now < this.agentSpeakingUntil - 200 && now - this.speechStartedAt > 600) {
+      this.interruptAgent();
+    }
+  }
+
+  interruptAgent() {
+    this.speakEpoch += 1; // abandons the sentence currently streaming
+    this.agentSpeakingUntil = 0;
+    this.lastInterruptAt = Date.now();
+    console.log('[Call] Caller barged in, stopping agent audio');
+    try {
+      if (this.ws.readyState === 1) {
+        const sidKey = (this.provider === 'twilio' || this.provider === 'web' || this.provider === 'browser') ? 'streamSid' : 'stream_sid';
+        this.ws.send(JSON.stringify({ event: 'clear', [sidKey]: this.streamSid }));
+      }
+    } catch {
+      /* socket already closing */
+    }
   }
 
   startSilenceMonitor() {

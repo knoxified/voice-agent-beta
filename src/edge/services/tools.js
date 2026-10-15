@@ -5,15 +5,17 @@
 // guard here is deliberately strict and independent of the model.
 
 import { triggerAutomation } from './n8n.js';
+import { rangesLabels } from './scheduling.js';
 
 const MAX_AVAILABILITY_CHECKS = 4; // per call (1 credit each)
 const MAX_BOOKINGS = 2; // per call (2 credits each)
 const MAX_DAYS_AHEAD = 120;
 
-export const TOOL_DEFS = [
-  {
-    type: 'function',
-    function: {
+// check_availability is run by the code (scheduling.js) when the caller names a
+// day, NOT by the model, so the calendar is checked once per day, never invented.
+export const AVAILABILITY_TOOL = {
+  type: 'function',
+  function: {
       name: 'check_availability',
       description:
         'Look up open appointment times on ONE day. Use only after the caller has agreed to come in / be set up with the team and you know roughly which day suits them. Costs credits, so do not call it speculatively or to browse.',
@@ -26,13 +28,15 @@ export const TOOL_DEFS = [
         required: ['date'],
       },
     },
-  },
+};
+
+export const TOOL_DEFS = [
   {
     type: 'function',
     function: {
       name: 'book_appointment',
       description:
-        'Book the appointment. Call this ONLY after ALL of these are true: the caller is a genuine fit and agreed to come in, they chose a time that check_availability returned, you collected their full name and email, and you READ BOTH BACK letter by letter and the caller said yes. If anything is missing, keep collecting it instead of calling this. A phone number is optional and must never be requested.',
+        'Book the appointment. Call this ONLY after ALL of these are true: the caller is a genuine fit and agreed to come in, they chose a time from the calendar results in your notes, you collected their full name and email, and you READ BOTH BACK letter by letter and the caller said yes. If anything is missing, keep collecting it instead of calling this. A phone number is optional and must never be requested.',
       parameters: {
         type: 'object',
         properties: {
@@ -179,6 +183,7 @@ async function runAvailability(session, args) {
     date,
     timezone: tz,
     openTimes: labels,
+    openRanges: rangesLabels(starts, tz),
     hasOpenings: starts.length > 0,
     instruction: starts.length
       ? 'Offer two or three of these times naturally (for example "I have 10 or 2:30"). Never read the whole list.'
@@ -190,6 +195,8 @@ async function runAvailability(session, args) {
 
 async function runBooking(session, args) {
   const tz = businessTimeZone(session);
+  // The time the caller chose is locked in by the code; the model cannot drift from it.
+  if (session.selectedSlot) args = { ...args, date: session.selectedSlot.date, time: session.selectedSlot.time };
   const name = String(args.name || '').trim();
   const email = String(args.email || '').trim().toLowerCase();
   const date = String(args.date || '').trim();
