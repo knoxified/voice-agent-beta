@@ -6,6 +6,7 @@
 
 import { triggerAutomation } from './n8n.js';
 import { rangesLabels } from './scheduling.js';
+import { logPendingQuestion } from './supabase.js';
 
 const MAX_AVAILABILITY_CHECKS = 4; // per call (1 credit each)
 const MAX_BOOKINGS = 2; // per call (2 credits each)
@@ -28,6 +29,28 @@ export const AVAILABILITY_TOOL = {
         required: ['date'],
       },
     },
+};
+
+
+const MAX_QUESTIONS = 3; // per call
+
+// Offered on every turn: when the caller asks something the agent genuinely
+// cannot answer from its notes, it hands the question to the owner instead of
+// guessing. Costs nothing (no webhook).
+export const QUESTION_TOOL = {
+  type: 'function',
+  function: {
+    name: 'take_question',
+    description:
+      'Use ONLY when the caller asks a factual question about the business (price, policy, service, availability of something) that is NOT answered in your notes. Never guess. This passes the question to the owner, who will follow up. Do not use it for small talk, booking, or things you can answer.',
+    parameters: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: "The caller's question, restated clearly in one short sentence." },
+      },
+      required: ['question'],
+    },
+  },
 };
 
 export const TOOL_DEFS = [
@@ -130,7 +153,26 @@ export async function executeTool(session, call) {
 
   if (name === 'check_availability') return runAvailability(session, args);
   if (name === 'book_appointment') return runBooking(session, args);
+  if (name === 'take_question') return runTakeQuestion(session, args);
   return { ok: false, error: 'unknown_tool' };
+}
+
+
+async function runTakeQuestion(session, args) {
+  const question = String(args.question || '').trim();
+  if (question.length < 4) {
+    return { ok: false, error: 'empty_question', instruction: 'Ask the caller to repeat what they want to know.' };
+  }
+  if ((session.questionsLogged || 0) >= MAX_QUESTIONS) {
+    return { ok: true, noted: true, instruction: 'Already noted several questions. Say the team will follow up on those, and move on.' };
+  }
+  session.questionsLogged = (session.questionsLogged || 0) + 1;
+  await logPendingQuestion(session.env, session.userId, question, session.callId, session.callerNumber);
+  return {
+    ok: true,
+    noted: true,
+    instruction: 'Tell the caller, briefly and naturally, that you have noted their question and the team will get back to them. Do not guess an answer. Then continue the conversation.',
+  };
 }
 
 async function runAvailability(session, args) {

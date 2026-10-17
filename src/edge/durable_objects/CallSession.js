@@ -1,7 +1,8 @@
 import { createLiveTranscription, sendAudio as sendToDeepgram, keepAlive } from '../services/stt.js';
 import { generateWithTools } from '../services/llm.js';
 import { synthesizeSpeech, streamSpeech } from '../services/tts.js';
-import { TOOL_DEFS, executeTool, businessTimeZone } from '../services/tools.js';
+import { TOOL_DEFS, QUESTION_TOOL, executeTool, businessTimeZone } from '../services/tools.js';
+import { decideOutcome, buildCallSummary } from '../services/callSummary.js';
 import { classifyStage } from '../services/qualifier.js';
 import { parseDayMention, parseTimeMention, matchSlot, dayLabel } from '../services/scheduling.js';
 import { sanitizeRules, matchRoutingRule, isValidE164 } from '../services/routing.js';
@@ -75,6 +76,7 @@ export class CallSession {
     this.lastInterruptAt = 0;
     this.bookingsMade = 0;
     this.bookingConfirmed = null;
+    this.questionsLogged = 0;
     this.callerTurns = 0;
 
     // Silence handling: ask "still there?" after SILENCE_PROMPT, hang up
@@ -439,7 +441,7 @@ export class CallSession {
           this.env,
           working,
           this.resolvedTemperature,
-          round < MAX_TOOL_ROUNDS && this.actionUnlocked ? TOOL_DEFS : null
+          round < MAX_TOOL_ROUNDS ? (this.actionUnlocked ? [...TOOL_DEFS, QUESTION_TOOL] : [QUESTION_TOOL]) : null
         );
 
         if (result.toolCalls) {
@@ -919,6 +921,8 @@ export class CallSession {
       }
     }
 
+    lines.push('', 'If the caller asks a factual question about the business that is not covered in your notes above, do NOT guess or invent an answer. Use the take_question tool so the owner can follow up, and tell the caller the team will get back to them.');
+
     // Industry-specific tone/vocabulary from whichever Systems (verticals)
     // the client has activated -- e.g. plumbing calls talk about triage and
     // dispatch, dental calls stay reassuring and never give clinical advice.
@@ -961,6 +965,20 @@ export class CallSession {
     }
 
     if (this.messages.length > 0) {
+      // Only calls where the caller actually said something become leads --
+      // a hang-up during the greeting or a silent line is not a lead.
+      const callerSpoke = this.messages.some(
+        (m) => m.role === 'user' && typeof m.content === 'string' && m.content.trim().length > 0
+      );
+
+      // Outcome comes from facts about the call; the summary is best-effort.
+      const outcome = decideOutcome({
+        callerSpoke,
+        bookingConfirmed: !!this.bookingConfirmed,
+        questionsLogged: this.questionsLogged,
+      });
+      const summary = await buildCallSummary(this.env, { messages: this.messages, outcome });
+
       await saveCallTranscript(
         this.env,
         this.userId,
@@ -968,14 +986,10 @@ export class CallSession {
         this.callerNumber,
         this.provider,
         durationSecs,
-        this.messages
+        this.messages,
+        { summary, outcome }
       );
 
-      // Only calls where the caller actually said something become leads --
-      // a hang-up during the greeting or a silent line is not a lead.
-      const callerSpoke = this.messages.some(
-        (m) => m.role === 'user' && typeof m.content === 'string' && m.content.trim().length > 0
-      );
       if (callerSpoke) {
         await recordInboundLead(this.env, this.userId, this.callerNumber, this.callId);
       }
@@ -1036,6 +1050,7 @@ const SILENCE_GOODBYE_LINES = [
 
 const FILLERS = {
   check_availability: ['Let me check that for you.', 'One moment while I look at the calendar.', 'Give me just a second to check.'],
+  take_question: ['Let me make a note of that.', 'Good question, let me note that down.'],
   book_appointment: ['Give me a moment while I get that set up.', 'One moment, I am booking that for you now.', 'Bear with me a second while I lock that in.'],
 };
 

@@ -235,7 +235,7 @@ async function deductSeconds(env, userId, seconds, sessionId) {
   }
 }
 
-async function saveCallTranscript(env, userId, callId, callerNumber, provider, durationSecs, messages) {
+async function saveCallTranscript(env, userId, callId, callerNumber, provider, durationSecs, messages, extra = {}) {
   const supabase = db(env);
   try {
     // Upsert, not insert: the Twilio recording-status webhook may arrive
@@ -252,6 +252,9 @@ async function saveCallTranscript(env, userId, callId, callerNumber, provider, d
         provider: provider || null,
         duration_secs: durationSecs || 0,
         messages: (messages || []).filter((m) => m.role !== 'system'),
+        // Only included when present, so a failed summary never blocks the save.
+        ...(extra.summary ? { summary: extra.summary } : {}),
+        ...(extra.outcome ? { outcome: extra.outcome } : {}),
       },
       { onConflict: 'call_id' }
     );
@@ -289,6 +292,46 @@ async function saveCallRecordingUrl(env, callId, recordingUrl) {
     }
   } catch (err) {
     console.error('[Supabase] saveCallRecordingUrl exception:', err.message);
+  }
+}
+
+
+// Normalised key so "What are your prices?" and "what's the price" land on one
+// open row. Drops filler words, keeps the first few meaningful ones, sorted.
+function questionKey(question) {
+  const stop = new Set(['the','a','an','is','are','do','does','you','your','what','whats','how','can','could','i','we','my','me','to','of','for','and','or','it','this','that','have','has','there','any','about','please','much','many']);
+  const words = String(question || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w && !stop.has(w));
+  return [...new Set(words)].slice(0, 8).sort().join(' ') || String(question || '').toLowerCase().slice(0, 80);
+}
+
+// A question the agent could not answer, handed to the owner's "Questions
+// waiting" queue. Repeats merge into one row (asked_count goes up).
+// Best-effort: a failure must never affect the call.
+async function logPendingQuestion(env, userId, question, callId, callerNumber) {
+  const q = String(question || '').trim().slice(0, 300);
+  if (!userId || q.length < 4) return { ok: false };
+  const supabase = db(env);
+  try {
+    const { data, error } = await supabase.rpc('log_pending_question', {
+      p_user_id: userId,
+      p_question: q,
+      p_question_key: questionKey(q),
+      p_call_id: callId || null,
+      p_caller_number: callerNumber || null,
+    });
+    if (error) {
+      console.error('[Supabase] logPendingQuestion error:', error.message);
+      return { ok: false };
+    }
+    const row = Array.isArray(data) ? data[0] : data;
+    return { ok: true, isNew: !!row?.is_new };
+  } catch (err) {
+    console.error('[Supabase] logPendingQuestion exception:', err.message);
+    return { ok: false };
   }
 }
 
@@ -436,4 +479,5 @@ export {
   saveCallTranscript,
   saveCallRecordingUrl,
   recordInboundLead,
+  logPendingQuestion,
 };
