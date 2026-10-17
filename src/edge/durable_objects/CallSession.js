@@ -898,6 +898,27 @@ export class CallSession {
       lines.push('', 'What you know about this business (use naturally, do not read this list back verbatim):', cfg.memory_context);
     }
 
+    // Saved from the dashboard's website scan (the owner can edit both).
+    if (cfg.website_summary) {
+      lines.push('', 'From the business website:', String(cfg.website_summary).slice(0, 3000));
+    }
+    if (Array.isArray(cfg.faqs) && cfg.faqs.length) {
+      const faqLines = [];
+      let used = 0;
+      for (const f of cfg.faqs) {
+        const q = String(f?.q || '').trim();
+        const a = String(f?.a || '').trim();
+        if (!q || !a) continue;
+        const entry = `Q: ${q}\nA: ${a}`;
+        if (used + entry.length > 3000) break; // keep the prompt (and replies) fast
+        faqLines.push(entry);
+        used += entry.length;
+      }
+      if (faqLines.length) {
+        lines.push('', 'Frequently asked questions (answer from these when relevant, in your own natural words, never recite them):', ...faqLines);
+      }
+    }
+
     // Industry-specific tone/vocabulary from whichever Systems (verticals)
     // the client has activated -- e.g. plumbing calls talk about triage and
     // dispatch, dental calls stay reassuring and never give clinical advice.

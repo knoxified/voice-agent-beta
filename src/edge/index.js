@@ -120,10 +120,18 @@ app.post('/voice/preview', async (c) => {
     getAgentConfig(c.env, user.id),
   ]);
 
-  const previewText = buildGreeting(agentConfig, voiceSettings?.agent_greeting, false, agentConfig?.require_ai_disclosure !== false);
+  // The dashboard can ask to hear ANY voice with the name currently typed,
+  // without saving anything first, so owners can compare voices quickly.
+  const body = await c.req.json().catch(() => ({}));
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const voiceOverride = typeof body.voiceId === 'string' && UUID_RE.test(body.voiceId) ? body.voiceId : null;
+  const nameOverride = typeof body.agentName === 'string' ? body.agentName.trim().slice(0, 40) : '';
+  const previewConfig = nameOverride ? { ...(agentConfig || {}), agent_nickname: nameOverride } : agentConfig;
+
+  const previewText = buildGreeting(previewConfig, voiceSettings?.agent_greeting, false, agentConfig?.require_ai_disclosure !== false);
 
   try {
-    const audio = await synthesizeSpeech(c.env, previewText, voiceSettings?.preferred_voice_id, 'mp3');
+    const audio = await synthesizeSpeech(c.env, previewText, voiceOverride || voiceSettings?.preferred_voice_id, 'mp3');
     if (!audio) return c.json({ error: 'synthesis_failed' }, 500);
     return new Response(audio, {
       headers: { 'Content-Type': 'audio/mpeg', 'Cache-Control': 'no-store' },

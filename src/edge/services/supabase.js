@@ -358,13 +358,18 @@ async function getEnabledSystemPrompts(env, userId, overrideSystemType = null) {
 async function getAgentConfig(env, userId) {
   const supabase = db(env);
   try {
-    const { data, error } = await supabase
+    const BASE_COLS =
+      'organization_name, agent_nickname, agent_position, business_hours, business_location, main_call_to_action, custom_system_prompt, memory_context, negative_instructions, call_recording_enabled, temperature, system_type, require_ai_disclosure, custom_intents, business_phone';
+    let { data, error } = await supabase
       .from('agent_configs')
-      .select(
-        'organization_name, agent_nickname, agent_position, business_hours, business_location, main_call_to_action, custom_system_prompt, memory_context, negative_instructions, call_recording_enabled, temperature, system_type, require_ai_disclosure, custom_intents, business_phone'
-      )
+      .select(`${BASE_COLS}, website_summary, faqs`)
       .eq('user_id', userId)
       .maybeSingle();
+
+    // Website-knowledge columns not migrated yet: load without them.
+    if (error && /website_summary|faqs|does not exist|could not find/i.test(error.message || '')) {
+      ({ data, error } = await supabase.from('agent_configs').select(BASE_COLS).eq('user_id', userId).maybeSingle());
+    }
 
     if (error || !data) return null;
     return data;
