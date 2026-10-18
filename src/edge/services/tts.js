@@ -80,7 +80,18 @@ async function synthesizeTelnyx(env, text) {
 // for the whole clip, so the caller hears the first words ~0.5s sooner.
 // Raw mu-law is 1 byte per sample, so any chunk boundary is safe. Returns
 // total bytes sent. Falls back to the buffered path for non-Cartesia TTS.
-async function streamSpeech(env, text, voiceId, onChunk, shouldStop) {
+const EMOTIONS = new Set(['neutral', 'content', 'calm', 'sympathetic', 'enthusiastic', 'curious', 'confident', 'apologetic']);
+
+// Cartesia sonic-3 accepts speed 0.6-1.5 and (beta) an emotion as guidance.
+function buildGenerationConfig(opts = {}) {
+  const cfg = {};
+  const speed = Number(opts.speed);
+  if (Number.isFinite(speed) && speed > 0) cfg.speed = Math.min(1.5, Math.max(0.6, speed));
+  if (opts.emotion && EMOTIONS.has(String(opts.emotion))) cfg.emotion = String(opts.emotion);
+  return Object.keys(cfg).length ? cfg : null;
+}
+
+async function streamSpeech(env, text, voiceId, onChunk, shouldStop, opts = {}) {
   if (!text || text.trim().length === 0) return 0;
   const provider = env.TTS_PROVIDER || 'cartesia';
   if (provider !== 'cartesia') {
@@ -92,25 +103,42 @@ async function streamSpeech(env, text, voiceId, onChunk, shouldStop) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 12000);
   try {
-    const res = await fetch('https://api.cartesia.ai/tts/bytes', {
-      method: 'POST',
-      headers: {
-        'X-API-Key': env.CARTESIA_API_KEY,
-        'Cartesia-Version': '2026-03-01',
-        'Content-Type': 'application/json',
+    const baseBody = {
+      model_id: env.CARTESIA_MODEL_ID || 'sonic-3',
+      transcript: text,
+      voice: {
+        mode: 'id',
+        id: voiceId || env.CARTESIA_VOICE_ID_DEFAULT || env.CARTESIA_VOICE_ID || 'e07c00bc-4134-4eae-9ea4-1a55fb45746b',
       },
-      body: JSON.stringify({
-        model_id: env.CARTESIA_MODEL_ID || 'sonic-3',
-        transcript: text,
-        voice: {
-          mode: 'id',
-          id: voiceId || env.CARTESIA_VOICE_ID_DEFAULT || env.CARTESIA_VOICE_ID || 'e07c00bc-4134-4eae-9ea4-1a55fb45746b',
+      output_format: { container: 'raw', encoding: 'pcm_mulaw', sample_rate: 8000 },
+      language: 'en',
+    };
+    const request = (generationConfig) =>
+      fetch('https://api.cartesia.ai/tts/bytes', {
+        method: 'POST',
+        headers: {
+          'X-API-Key': env.CARTESIA_API_KEY,
+          'Cartesia-Version': '2026-03-01',
+          'Content-Type': 'application/json',
         },
-        output_format: { container: 'raw', encoding: 'pcm_mulaw', sample_rate: 8000 },
-        language: 'en',
-      }),
-      signal: controller.signal,
-    });
+        body: JSON.stringify(generationConfig ? { ...baseBody, generation_config: generationConfig } : baseBody),
+        signal: controller.signal,
+      });
+
+    // Delivery (speed/emotion) is guidance and the emotion list is a beta: if
+    // Cartesia rejects it, drop emotion, then drop the config, so the caller
+    // always hears the reply rather than silence.
+    const genCfg = buildGenerationConfig(opts);
+    let res = await request(genCfg);
+    if (!res.ok && genCfg?.emotion && (res.status === 400 || res.status === 422)) {
+      console.warn('[TTS] emotion rejected, retrying without it');
+      const { emotion, ...rest } = genCfg;
+      res = await request(Object.keys(rest).length ? rest : null);
+    }
+    if (!res.ok && genCfg && (res.status === 400 || res.status === 422)) {
+      console.warn('[TTS] generation_config rejected, retrying plain');
+      res = await request(null);
+    }
 
     if (!res.ok || !res.body) {
       const errText = await res.text().catch(() => '');
@@ -144,4 +172,4 @@ async function streamSpeech(env, text, voiceId, onChunk, shouldStop) {
   }
 }
 
-export { synthesizeSpeech, streamSpeech };
+export { synthesizeSpeech, streamSpeech, EMOTIONS };

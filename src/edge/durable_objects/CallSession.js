@@ -1,6 +1,6 @@
 import { createLiveTranscription, sendAudio as sendToDeepgram, keepAlive } from '../services/stt.js';
 import { generateWithTools } from '../services/llm.js';
-import { synthesizeSpeech, streamSpeech } from '../services/tts.js';
+import { synthesizeSpeech, streamSpeech, EMOTIONS } from '../services/tts.js';
 import { TOOL_DEFS, QUESTION_TOOL, executeTool, businessTimeZone } from '../services/tools.js';
 import { decideOutcome, buildCallSummary } from '../services/callSummary.js';
 import { classifyStage } from '../services/qualifier.js';
@@ -323,6 +323,12 @@ export class CallSession {
         : systemVoiceDefaults?.default_temperature != null ? systemVoiceDefaults.default_temperature
         : 0.7);
     this.toneDirective = systemVoiceDefaults?.tone_directive || null;
+    // Industry personality (see systems_catalog.playbook etc.): how the person in
+    // this role behaves, what a worthwhile caller looks like, and how they sound.
+    this.playbook = systemVoiceDefaults?.playbook || null;
+    this.qualificationCriteria = systemVoiceDefaults?.qualification_criteria || null;
+    this.speechSpeed = Number(systemVoiceDefaults?.speech_speed) || null;
+    this.speechEmotion = systemVoiceDefaults?.speech_emotion || null;
 
     // Voice resolution: a previewed system always uses its own vertical voice.
     // On a normal call, an account that explicitly picked a voice keeps it;
@@ -474,6 +480,10 @@ export class CallSession {
       // End-of-call: the model appends [END] to its final goodbye; as a safety
       // net also end when the caller closed AND the agent said a farewell.
       aiText = dedupeRepeat(aiText);
+      let mood = null;
+      const moodMatch = aiText.match(/\[mood:\s*([a-z]+)\s*\]/i);
+      if (moodMatch && EMOTIONS.has(moodMatch[1].toLowerCase())) mood = moodMatch[1].toLowerCase();
+      aiText = aiText.replace(/\[mood:[^\]]*\]\s*/gi, '').trim();
       let endAfter = /\[END\]/i.test(aiText);
       aiText = aiText.replace(/\s*\[END\]\s*/gi, ' ').trim();
       if (!endAfter && FAREWELL_RE.test(aiText) && CALLER_CLOSING_RE.test(transcript)) endAfter = true;
@@ -488,7 +498,7 @@ export class CallSession {
       this.pushAssistant(aiText);
 
       const spokeAt = Date.now();
-      await this.speak(aiText);
+      await this.speak(aiText, { mood });
       if (endAfter && this.lastInterruptAt >= spokeAt) endAfter = false; // they talked over the goodbye
 
       if (endAfter) {
@@ -595,7 +605,7 @@ export class CallSession {
 
   updateStage() {
     const cfg = this.agentConfig || {};
-    return classifyStage(this.env, this.messages, { businessName: cfg.organization_name })
+    return classifyStage(this.env, this.messages, { businessName: cfg.organization_name, criteria: this.qualificationCriteria })
       .then((r) => {
         if (!r) return;
         let stage = r.stage;
@@ -634,7 +644,7 @@ export class CallSession {
   }
 
   // Speak text to the caller, streaming audio as it is generated.
-  async speak(text) {
+  async speak(text, opts = {}) {
     const epoch = ++this.speakEpoch;
     this.speechStartedAt = Date.now();
     await streamSpeech(
@@ -642,7 +652,8 @@ export class CallSession {
       text,
       this.voiceId,
       (chunk) => { if (epoch === this.speakEpoch) this.sendAudioToCaller(chunk); },
-      () => epoch !== this.speakEpoch
+      () => epoch !== this.speakEpoch,
+      { speed: this.speechSpeed, emotion: opts.mood || this.speechEmotion }
     );
   }
 
@@ -861,7 +872,12 @@ export class CallSession {
       '- Match their energy and pace. If they are brief, be brief. If they are chatty or upset, slow down and be warmer.',
       '- Do not repeat their words back, do not summarise, do not list options. Answer what was asked, then stop. Not every reply needs a question.',
       '- Use their name rarely, at most once or twice in a whole call.',
-      '- A light human touch is fine, such as "hm", "oh", "well", "right" now and then, but never forced.',
+      '- Short reactions are real speech: "mm-hm", "right", "oh no", "okay", "yeah". Sometimes a brief reaction plus one question is the whole reply. Vary them; never use the same one twice in a row.',
+      '- Show you were listening: use their own words and details from earlier ("you said it gets worse at night") and never ask again something they already told you.',
+      '- Let speech be a little imperfect: contractions, starting with "So," or "Well,", a dash or ellipsis for a thinking pause. Say numbers and times the way people do ("two thirty", "a couple of days").',
+      '- Match their length. A brief caller gets a brief reply. Someone telling a story or upset gets a beat of acknowledgment before any question.',
+      '- Never open with praise or filler like "Great question" or "Absolutely". Only state facts about the business that are in your notes; otherwise say you will check with the team.',
+      '- Emotion: you may begin a reply with ONE marker when the moment clearly calls for it: [mood:sympathetic] (caller in pain, worried or upset), [mood:enthusiastic] (good news or excitement), [mood:calm] (tense or urgent), [mood:apologetic] (something went wrong), [mood:curious], [mood:confident], [mood:content]. Use it only when it fits, not on every reply, and never mention it.',
       '- If you do not know something, say so plainly and offer to have someone follow up.',
       '- Ending the call: when the caller has clearly finished (says bye, thanks that is all, nothing else) give one short warm goodbye and put the exact marker [END] at the very end of that final message. Use [END] only for that final goodbye, never mid-conversation, and never mention it. Do not offer more help after they have said they are done.',
       '- You are an AI and the greeting already said so. Never pretend to be human, and if someone sincerely asks whether you are a person, tell them the truth in one calm sentence and carry on.',
@@ -891,6 +907,9 @@ export class CallSession {
     // rather than folded into one block.
     if (this.toneDirective) {
       lines.push('', `Tone for this call: ${this.toneDirective}`);
+    }
+    if (this.playbook) {
+      lines.push('', 'How a person in your role handles this call. This is your character and judgment: follow its spirit in your own words, never recite it:', this.playbook);
     }
 
     // memory_context is the free-text business summary the client wrote or

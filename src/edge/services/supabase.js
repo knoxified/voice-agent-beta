@@ -432,11 +432,20 @@ async function getSystemVoiceDefaults(env, systemType) {
   if (!systemType || systemType === 'general') return null;
   const supabase = db(env);
   try {
-    const { data, error } = await supabase
+    let { data, error } = await supabase
       .from('systems_catalog')
-      .select('default_temperature, tone_directive, voice_id')
+      .select('default_temperature, tone_directive, voice_id, playbook, qualification_criteria, speech_speed, speech_emotion')
       .eq('id', systemType)
       .maybeSingle();
+
+    // Persona columns not migrated yet: fall back to the original three.
+    if (error && /playbook|qualification_criteria|speech_|does not exist|could not find/i.test(error.message || '')) {
+      ({ data, error } = await supabase
+        .from('systems_catalog')
+        .select('default_temperature, tone_directive, voice_id')
+        .eq('id', systemType)
+        .maybeSingle());
+    }
 
     if (error || !data) return null;
     return data;

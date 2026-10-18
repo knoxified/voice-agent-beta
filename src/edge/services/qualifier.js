@@ -22,7 +22,7 @@ Stages:
 
 Be strict. Small talk or one vague mention is "discover". Choose "agreed" only if the agent proposed the step first and the caller said yes.`;
 
-export async function classifyStage(env, messages, { businessName } = {}) {
+export async function classifyStage(env, messages, { businessName, criteria } = {}) {
   const convo = messages
     .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.content)
     .slice(-10)
@@ -40,7 +40,7 @@ export async function classifyStage(env, messages, { businessName } = {}) {
     model,
     messages: [
       { role: 'system', content: SYSTEM },
-      { role: 'user', content: `Business: ${businessName || 'a local business'}\n\nConversation:\n${convo}\n\nJSON:` },
+      { role: 'user', content: `Business: ${businessName || 'a local business'}${criteria ? `\nWhat "qualified" means for this industry (follow this over the generic definition): ${String(criteria).slice(0, 1200)}` : ''}\n\nConversation:\n${convo}\n\nJSON:` },
     ],
     temperature: 0,
     // Reasoning models spend tokens thinking before the answer; leave room.
