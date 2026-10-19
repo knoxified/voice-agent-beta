@@ -366,6 +366,28 @@ async function recordInboundLead(env, userId, callerNumber, callId) {
 // emergency triage and dispatch, not generic receptionist filler. Each
 // system's industry_prompt is authored to match the real language used on
 // the marketing site for that vertical (see systems_catalog).
+// The industry system this account actually runs: its most recently activated
+// ENABLED system (user_systems), skipping 'custom' which has no persona of its own.
+// Real calls use this when agent_configs.system_type was never set (it defaults
+// to 'general', which no catalog row matches). `client` is injectable for tests.
+async function getPrimarySystemId(env, userId, client = null) {
+  try {
+    const supabase = client || db(env);
+    const { data, error } = await supabase
+      .from('user_systems')
+      .select('system_id, activated_at')
+      .eq('user_id', userId)
+      .eq('is_enabled', true)
+      .order('activated_at', { ascending: false, nullsFirst: false });
+    if (error || !data?.length) return null;
+    const row = data.find((r) => r.system_id && r.system_id !== 'custom');
+    return row ? row.system_id : null;
+  } catch (err) {
+    console.error('[Supabase] getPrimarySystemId error:', err.message);
+    return null;
+  }
+}
+
 async function getEnabledSystemPrompts(env, userId, overrideSystemType = null) {
   const supabase = db(env);
   try {
@@ -489,4 +511,5 @@ export {
   saveCallRecordingUrl,
   recordInboundLead,
   logPendingQuestion,
+  getPrimarySystemId,
 };

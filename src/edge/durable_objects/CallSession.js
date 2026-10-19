@@ -13,6 +13,7 @@ import {
   getAgentConfig,
   getEnabledSystemPrompts,
   getSystemVoiceDefaults,
+  getPrimarySystemId,
   getRemainingMinutes,
   deductSeconds,
   saveCallTranscript,
@@ -315,8 +316,13 @@ export class CallSession {
     // point, hearing how THAT system sounds, regardless of this account's
     // own temperature override. A normal call still respects the
     // account's own explicit override first.
-    const effectiveSystemType = this.systemTypeOverride || this.agentConfig.system_type;
-    const systemVoiceDefaults = await getSystemVoiceDefaults(this.env, effectiveSystemType);
+    // Which industry personality applies: a previewed system first, then an
+    // explicit system_type on the account, then the account's own enabled
+    // system (system_type defaults to 'general' and matches nothing).
+    const configuredType = this.agentConfig.system_type && this.agentConfig.system_type !== 'general' ? this.agentConfig.system_type : null;
+    const effectiveSystemType = this.systemTypeOverride || configuredType || (await getPrimarySystemId(this.env, this.userId));
+    console.log(`[Persona] system: ${effectiveSystemType || 'none'}${this.systemTypeOverride ? ' (preview)' : ''}`);
+    const systemVoiceDefaults = effectiveSystemType ? await getSystemVoiceDefaults(this.env, effectiveSystemType) : null;
     this.resolvedTemperature = this.systemTypeOverride
       ? (systemVoiceDefaults?.default_temperature ?? 0.7)
       : (this.agentConfig.temperature != null ? this.agentConfig.temperature
