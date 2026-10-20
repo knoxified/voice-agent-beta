@@ -361,6 +361,48 @@ async function recordInboundLead(env, userId, callerNumber, callId) {
   }
 }
 
+
+function cleanPhone(callerNumber) {
+  const phone = String(callerNumber || '').replace(/[\s()-]/g, '');
+  return /^\+?\d{6,15}$/.test(phone) ? phone : null;
+}
+
+// Name of a caller we have spoken to before (from the lead created at their
+// last call), matched by caller ID. Null for new, withheld or web callers.
+// Best-effort: never blocks or fails the call.
+async function getKnownCaller(env, userId, callerNumber) {
+  const phone = cleanPhone(callerNumber);
+  if (!userId || !phone) return null;
+  try {
+    const { data, error } = await db(env)
+      .from('leads')
+      .select('name, call_count')
+      .eq('user_id', userId)
+      .eq('phone', phone)
+      .maybeSingle();
+    if (error || !data) return null;
+    const name = String(data.name || '').trim();
+    return { name: name || null, callCount: data.call_count || 0 };
+  } catch (err) {
+    console.error('[Supabase] getKnownCaller exception:', err.message);
+    return null;
+  }
+}
+
+// After a booking, remember the caller's name/email on their lead -- only
+// where nothing is stored yet, so a shared phone never overwrites someone else.
+async function saveContactToLead(env, userId, callerNumber, { name, email }) {
+  const phone = cleanPhone(callerNumber);
+  if (!userId || !phone) return;
+  try {
+    const supabase = db(env);
+    if (name) await supabase.from('leads').update({ name }).eq('user_id', userId).eq('phone', phone).is('name', null);
+    if (email) await supabase.from('leads').update({ email }).eq('user_id', userId).eq('phone', phone).is('email', null);
+  } catch (err) {
+    console.error('[Supabase] saveContactToLead exception:', err.message);
+  }
+}
+
 // Industry-specific language for whichever systems (verticals) this user
 // has activated -- e.g. a plumbing company's agent should talk about
 // emergency triage and dispatch, not generic receptionist filler. Each
@@ -511,5 +553,7 @@ export {
   saveCallRecordingUrl,
   recordInboundLead,
   logPendingQuestion,
+  getKnownCaller,
+  saveContactToLead,
   getPrimarySystemId,
 };

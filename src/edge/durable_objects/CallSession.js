@@ -7,7 +7,7 @@ import { classifyStage } from '../services/qualifier.js';
 import { parseDayMention, parseTimeMention, matchSlot, dayLabel } from '../services/scheduling.js';
 import { sanitizeRules, matchRoutingRule, isValidE164 } from '../services/routing.js';
 import { telnyxTransfer, telnyxHangup } from '../services/telnyx.js';
-import {
+import { getKnownCaller, saveContactToLead,
   getUserById,
   getUserVoiceSettings,
   getAgentConfig,
@@ -77,6 +77,8 @@ export class CallSession {
     this.lastInterruptAt = 0;
     this.bookingsMade = 0;
     this.bookingConfirmed = null;
+    this.knownCaller = null;
+    this.capturedContact = null;
     this.questionsLogged = 0;
     this.callerTurns = 0;
 
@@ -295,11 +297,13 @@ export class CallSession {
     this.isTrial = user?.isTrial || false;
     console.log(`[Stream] User loaded | isTrial: ${this.isTrial}`);
 
-    const [voiceSettings, agentConfig, systemPrompts] = await Promise.all([
+    const [voiceSettings, agentConfig, systemPrompts, knownCaller] = await Promise.all([
       getUserVoiceSettings(this.env, this.userId),
       getAgentConfig(this.env, this.userId),
       getEnabledSystemPrompts(this.env, this.userId, this.systemTypeOverride || null),
+      this.isWebCall ? null : getKnownCaller(this.env, this.userId, this.callerNumber),
     ]);
+    this.knownCaller = knownCaller;
     this.quotaExceededMessage = voiceSettings.quota_exceeded_message;
     this.voiceId = voiceSettings.preferred_voice_id;
     this.agentConfig = agentConfig || {};
@@ -730,6 +734,11 @@ export class CallSession {
       }
     }
 
+    if (this.knownCaller?.name && !this.bookingConfirmed) {
+      const first = this.knownCaller.name.split(/\s+/)[0];
+      hints.push(`Returning caller: this phone number belongs to someone we know as ${this.knownCaller.name}, but it may be someone else using the phone. Do NOT assume. Early in this reply or the next natural moment, ask once, lightly: "Am I speaking with ${first}?" If yes, use their first name naturally from then on and, when you book, you already have their name (just say you are booking it under ${this.knownCaller.name}). If no, treat them as a new caller. Never mention past calls or any other detail you hold about them.`);
+    }
+
     if (this.bookingConfirmed) {
       const b = this.bookingConfirmed;
       hints.push(`A booking is already confirmed on this call (${b.name}, ${b.date} at ${b.time}). Do not book again. Confirm it warmly in one sentence, ask if there is anything else, and close the call naturally.`);
@@ -1059,6 +1068,7 @@ export class CallSession {
 
       if (callerSpoke) {
         await recordInboundLead(this.env, this.userId, this.callerNumber, this.callId);
+        if (this.capturedContact) await saveContactToLead(this.env, this.userId, this.callerNumber, this.capturedContact);
       }
     }
 

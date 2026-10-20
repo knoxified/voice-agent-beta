@@ -345,6 +345,7 @@ async function runBooking(session, args) {
   if (res?.status === true) {
     session.bookingsMade += 1;
     session.bookingConfirmed = { name, date, time };
+    session.capturedContact = { name, email }; // saved to the caller's lead when the call ends
     return { ok: true, booked: true, name, date, time, duration_minutes: duration };
   }
   return { ok: false, error: 'booking_failed', instruction: 'The booking did not go through. Do not claim it did. Take their details and say the team will follow up.' };
