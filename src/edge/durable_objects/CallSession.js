@@ -7,7 +7,7 @@ import { classifyStage } from '../services/qualifier.js';
 import { parseDayMention, parseTimeMention, matchSlot, dayLabel } from '../services/scheduling.js';
 import { sanitizeRules, matchRoutingRule, isValidE164 } from '../services/routing.js';
 import { telnyxTransfer, telnyxHangup } from '../services/telnyx.js';
-import { getKnownCaller, saveContactToLead,
+import { getKnownCaller, saveContactToLead, saveLeadCallDetails,
   getUserById,
   getUserVoiceSettings,
   getAgentConfig,
@@ -1060,7 +1060,8 @@ export class CallSession {
         bookingConfirmed: !!this.bookingConfirmed,
         questionsLogged: this.questionsLogged,
       });
-      const summary = await buildCallSummary(this.env, { messages: this.messages, outcome });
+      const analysis = await buildCallSummary(this.env, { messages: this.messages, outcome });
+      const summary = analysis.summary;
 
       await saveCallTranscript(
         this.env,
@@ -1075,7 +1076,19 @@ export class CallSession {
 
       if (callerSpoke) {
         await recordInboundLead(this.env, this.userId, this.callerNumber, this.callId);
-        if (this.capturedContact) await saveContactToLead(this.env, this.userId, this.callerNumber, this.capturedContact);
+        // A name/email the caller confirmed for a booking always wins; a name they
+        // simply said during the call fills in only when nothing else is known.
+        await saveContactToLead(this.env, this.userId, this.callerNumber, {
+          name: this.capturedContact?.name || analysis.name,
+          email: this.capturedContact?.email || null,
+        });
+        await saveLeadCallDetails(this.env, this.userId, this.callerNumber, {
+          reason: analysis.reason,
+          urgency: analysis.urgency,
+          tone: analysis.tone,
+          summary,
+          appointmentBooked: outcome === 'booked',
+        });
       }
     }
 

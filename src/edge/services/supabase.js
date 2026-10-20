@@ -403,6 +403,32 @@ async function saveContactToLead(env, userId, callerNumber, { name, email }) {
   }
 }
 
+
+// What the owner sees on the Leads table for this caller: why they called,
+// how urgent, their tone, whether an appointment was booked. Written to the
+// caller's lead after each call. Separate from the transcript save and fully
+// best-effort, so a missing column can never cost us the call record.
+async function saveLeadCallDetails(env, userId, callerNumber, d) {
+  const phone = cleanPhone(callerNumber);
+  if (!userId || !phone) return;
+  try {
+    const { error } = await db(env)
+      .from('leads')
+      .update({
+        reason: d.reason || null,
+        urgency: d.urgency || null,
+        caller_tone: d.tone || null,
+        appointment_booked: !!d.appointmentBooked,
+        last_call_summary: d.summary || null,
+      })
+      .eq('user_id', userId)
+      .eq('phone', phone);
+    if (error) console.error('[Supabase] saveLeadCallDetails error:', error.message);
+  } catch (err) {
+    console.error('[Supabase] saveLeadCallDetails exception:', err.message);
+  }
+}
+
 // Industry-specific language for whichever systems (verticals) this user
 // has activated -- e.g. a plumbing company's agent should talk about
 // emergency triage and dispatch, not generic receptionist filler. Each
@@ -555,5 +581,6 @@ export {
   logPendingQuestion,
   getKnownCaller,
   saveContactToLead,
+  saveLeadCallDetails,
   getPrimarySystemId,
 };
