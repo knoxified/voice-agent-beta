@@ -59,16 +59,16 @@ export const TOOL_DEFS = [
     function: {
       name: 'book_appointment',
       description:
-        'Book the appointment. Call this ONLY after ALL of these are true: the caller is a genuine fit and agreed to come in, they chose a time from the calendar results in your notes, you collected their full name and email, and you READ BOTH BACK letter by letter and the caller said yes. If anything is missing, keep collecting it instead of calling this. A phone number is optional and must never be requested.',
+        'Book the appointment. Call this ONLY after ALL of these are true: the caller is a genuine fit and agreed to come in, they chose a time from the calendar results in your notes, you collected their full name and email, read both back, and the caller said yes. If anything is missing, keep collecting it instead of calling this. A phone number is optional and must never be requested.',
       parameters: {
         type: 'object',
         properties: {
           name: { type: 'string', description: "Caller's full name, exactly as confirmed." },
-          email: { type: 'string', description: "Caller's email address, exactly as confirmed letter by letter." },
+          email: { type: 'string', description: "Caller's email address, exactly as confirmed." },
           date: { type: 'string', description: 'Appointment day, YYYY-MM-DD, from the Upcoming days list.' },
           time: { type: 'string', description: 'Appointment start time, 24-hour HH:MM, one of the times check_availability returned.' },
           reason: { type: 'string', description: 'One short sentence on the main reason for the call and visit, from what the caller told you (for example "Itchy fluid-filled bumps on hand for about 5 days"). Under 100 characters.' },
-          details_confirmed: { type: 'boolean', description: 'true ONLY if you read the name and email back letter by letter and the caller confirmed they are correct.' },
+          details_confirmed: { type: 'boolean', description: 'true ONLY if you read the name and email back and the caller confirmed they are correct.' },
           phone: { type: 'string', description: 'Optional. Only if the caller volunteered a number.' },
           duration_minutes: { type: 'integer', description: 'Length in minutes. Default 30.' },
         },
@@ -235,6 +235,23 @@ async function runAvailability(session, args) {
   return result;
 }
 
+
+// Spoken emails are the most error-prone thing on a call. Catch the common
+// domain typos (and speech-to-text slips like ".con") before they become a
+// booking that never reaches the caller.
+const DOMAIN_FIXES = {
+  'gmial.com': 'gmail.com', 'gmai.com': 'gmail.com', 'gmal.com': 'gmail.com', 'gnail.com': 'gmail.com', 'gmail.co': 'gmail.com', 'gmail.con': 'gmail.com', 'gamil.com': 'gmail.com',
+  'yaho.com': 'yahoo.com', 'yahooo.com': 'yahoo.com', 'yahoo.co': 'yahoo.com', 'yahoo.con': 'yahoo.com',
+  'hotmial.com': 'hotmail.com', 'hotmai.com': 'hotmail.com', 'hotmail.con': 'hotmail.com',
+  'outlok.com': 'outlook.com', 'outloo.com': 'outlook.com', 'outlook.con': 'outlook.com',
+  'icloud.con': 'icloud.com', 'iclod.com': 'icloud.com',
+};
+
+function emailDomainSuggestion(email) {
+  const domain = String(email || '').split('@')[1] || '';
+  return DOMAIN_FIXES[domain] || (domain.endsWith('.con') ? domain.slice(0, -1) + 'm' : null);
+}
+
 async function runBooking(session, args) {
   const tz = businessTimeZone(session);
   // The time the caller chose is locked in by the code; the model cannot drift from it.
@@ -255,11 +272,27 @@ async function runBooking(session, args) {
     return { ok: false, error: 'missing_details', missing, instruction: `Do not book yet. Naturally ask the caller for: ${missing.join(', ')}.` };
   }
 
+  // A likely typo in the domain: have the agent double-check once. If the
+  // caller confirms the same address, the second attempt goes through.
+  const suggestion = emailDomainSuggestion(email);
+  if (suggestion) {
+    session.emailDoubleChecked = session.emailDoubleChecked || new Set();
+    if (!session.emailDoubleChecked.has(email)) {
+      session.emailDoubleChecked.add(email);
+      return {
+        ok: false,
+        error: 'email_domain_check',
+        instruction: `Do not book yet. The email domain may have been misheard. Ask naturally: "Just to be sure, is that ${suggestion.replace('.', ' dot ')}?" If they say yes, use the corrected address. If they insist the original is right, call this again with the original.`,
+        suggestedEmail: email.split('@')[0] + '@' + suggestion,
+      };
+    }
+  }
+
   if (args.details_confirmed !== true) {
     return {
       ok: false,
       error: 'details_not_confirmed',
-      instruction: 'Do not book yet. Read the full name and the email back to the caller letter by letter (for example K-N-O-X, F-A-V-O-R at gmail dot com), ask if both are correct, fix anything wrong, and only call this again once they say yes.',
+      instruction: 'Do not book yet. Repeat the name back, then read the email back in short pieces (the part before the at sign, then at, then the domain as one word), ask if both are correct, fix only what is wrong, and call this again once they say yes.',
     };
   }
 

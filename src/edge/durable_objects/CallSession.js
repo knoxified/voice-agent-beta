@@ -1,5 +1,5 @@
 import { createLiveTranscription, sendAudio as sendToDeepgram, keepAlive } from '../services/stt.js';
-import { generateWithTools } from '../services/llm.js';
+import { generateWithTools, streamWithTools } from '../services/llm.js';
 import { synthesizeSpeech, streamSpeech, EMOTIONS } from '../services/tts.js';
 import { TOOL_DEFS, QUESTION_TOOL, executeTool, businessTimeZone } from '../services/tools.js';
 import { decideOutcome, buildCallSummary } from '../services/callSummary.js';
@@ -447,14 +447,26 @@ export class CallSession {
       const MAX_TOOL_ROUNDS = 2;
       let aiText = null;
       let usedTool = false;
+      let streamedFinal = false;
+      let finalSpeaker = null;
 
       for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
-        const result = await generateWithTools(
-          this.env,
-          working,
-          this.resolvedTemperature,
-          round < MAX_TOOL_ROUNDS ? (this.actionUnlocked ? [...TOOL_DEFS, QUESTION_TOOL] : [QUESTION_TOOL]) : null
-        );
+        const toolList = round < MAX_TOOL_ROUNDS ? (this.actionUnlocked ? [...TOOL_DEFS, QUESTION_TOOL] : [QUESTION_TOOL]) : null;
+
+        // Speak each sentence as the model writes it, so the first words reach
+        // the caller while the rest is still being generated. If streaming
+        // fails before anything was said, fall back to the one-shot call.
+        const speaker = this.makeStreamSpeaker();
+        let result;
+        try {
+          result = await streamWithTools(this.env, working, this.resolvedTemperature, toolList, speaker.onSentence);
+        } catch (err) {
+          if (speaker.count() > 0) throw err;
+          console.warn('[LLM] stream failed, using one-shot:', err.message);
+          result = await generateWithTools(this.env, working, this.resolvedTemperature, toolList);
+        }
+        await speaker.drain();
+        if (!result.toolCalls) { streamedFinal = result.streamed; finalSpeaker = speaker; }
 
         if (result.toolCalls) {
           usedTool = true;
@@ -463,7 +475,11 @@ export class CallSession {
           // Speak a short filler FIRST so there is no dead air while the
           // calendar / booking webhook runs.
           const first = result.toolCalls[0].function?.name;
-          await this.speakFiller(result.content || pickFiller(first));
+          if (result.streamedLeadIn) {
+            this.pushAssistant(speaker.text()); // already spoken while streaming
+          } else {
+            await this.speakFiller(result.content || pickFiller(first));
+          }
 
           for (const call of result.toolCalls) {
             const out = await executeTool(this, call);
@@ -503,8 +519,9 @@ export class CallSession {
 
       this.pushAssistant(aiText);
 
-      const spokeAt = Date.now();
-      await this.speak(aiText, { mood });
+      const spokeAt = streamedFinal ? turnStart : Date.now();
+      if (!streamedFinal) await this.speak(aiText, { mood });
+      else if (finalSpeaker) mood = finalSpeaker.mood() || mood;
       if (endAfter && this.lastInterruptAt >= spokeAt) endAfter = false; // they talked over the goodbye
 
       if (endAfter) {
@@ -603,9 +620,9 @@ export class CallSession {
       return L.join('\n');
     }
     L.push(`2) LOCKED IN: ${this.selectedSlot.label} on ${dl}. This time is open and final. Do not offer, mention or discuss any other time, and never check the calendar again unless THEY ask for a different day.`);
-    L.push('3) Collect their full name and email. Ask them to spell each letter by letter (say "at" and "dot"). Never ask for a phone number; accept it only if they offer.');
-    L.push('4) Read the name and the email back to them letter by letter (for example K-N-O-X, F-A-V-O-R at gmail dot com) and ask if both are right. Fix anything wrong and read it back again. Do not move on until they say yes.');
-    L.push('5) Only then use book_appointment with a one-sentence reason for the visit taken from what they told you, and details_confirmed true. Say "one moment" naturally first. Never say it is booked until the tool confirms.');
+    L.push('3) Name: ask for their full name. When they say it, repeat it back ONCE in a natural way ("Sarah Okafor, is that right?"). Spell it letter by letter only if they correct you or it is an unusual name you are unsure of.');
+    L.push('4) Email: ask for their best email and tell them to take it slowly. Read it back in short pieces with a natural pause: the part before the at sign first, then "at", then the domain. Say common domains as one word ("gmail dot com", "yahoo dot com", "outlook dot com"), never spelled out. Spell letter by letter only the part before the at sign, and only if it is not a plain word. Then ask "did I get that right?" If something is wrong, fix just that piece and read only that piece back again. Do not move on until they say yes. Never ask for a phone number; accept it only if they offer.');
+    L.push('5) Only after they confirm both the name and the email, use book_appointment with a one-sentence reason for the visit taken from what they told you, and details_confirmed true. Say "one moment" naturally first. Never say it is booked until the tool confirms.');
     return L.join('\n');
   }
 
@@ -631,6 +648,31 @@ export class CallSession {
       const sys = this.messages[0];
       this.messages = [sys, ...this.messages.slice(-20)];
     }
+  }
+
+  // Turns streamed sentences into audio in order. Each sentence is spoken as
+  // soon as the previous one has been handed to the line. If the caller
+  // interrupts, the rest of the reply is dropped.
+  makeStreamSpeaker() {
+    const interruptMark = this.lastInterruptAt;
+    let chain = Promise.resolve();
+    const spoken = [];
+    let mood = null;
+    const onSentence = (raw) => {
+      let t = String(raw || '');
+      const mm = t.match(/\[mood:\s*([a-z]+)\s*\]/i);
+      if (mm && !mood && EMOTIONS.has(mm[1].toLowerCase())) mood = mm[1].toLowerCase();
+      t = t.replace(/\[mood:[^\]]*\]\s*/gi, '').replace(/\s*\[END\]\s*/gi, ' ').trim();
+      if (!t || spoken[spoken.length - 1] === t) return;
+      spoken.push(t);
+      chain = chain
+        .then(() => {
+          if (this.lastInterruptAt !== interruptMark || this.transferInProgress) return null;
+          return this.speak(t, { mood });
+        })
+        .catch((e) => console.error('[Speak] sentence failed:', e.message));
+    };
+    return { onSentence, drain: () => chain, text: () => spoken.join(' '), count: () => spoken.length, mood: () => mood };
   }
 
   async speakFiller(text) {
@@ -876,7 +918,7 @@ export class CallSession {
       '- React to what they just said before you ask anything, in a way that fits it (for example "oh no, that sounds painful" or "okay, got it" or "hm, that is odd"). Vary your openers; never start two replies the same way.',
       '- Banned phrases: "I\'m here to help", "How may I assist", "Certainly", "Absolutely" (more than rarely), "I understand your concern", "Feel free to", "Is there anything else I can help with" after every answer, "As an AI", and calling yourself a virtual assistant or receptionist after the greeting. Do not stack exclamation marks.',
       '- Match their energy and pace. If they are brief, be brief. If they are chatty or upset, slow down and be warmer.',
-      '- Do not repeat their words back, do not summarise, do not list options. Answer what was asked, then stop. Not every reply needs a question.',
+      '- Do not repeat their words back, do not summarise, do not list options (the one exception: confirming their name and email when booking). Answer what was asked, then stop. Not every reply needs a question.',
       '- Use their name rarely, at most once or twice in a whole call.',
       '- Short reactions are real speech: "mm-hm", "right", "oh no", "okay", "yeah". Sometimes a brief reaction plus one question is the whole reply. Vary them; never use the same one twice in a row.',
       '- Show you were listening: use their own words and details from earlier ("you said it gets worse at night") and never ask again something they already told you.',
