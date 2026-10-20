@@ -327,11 +327,11 @@ export class CallSession {
     const effectiveSystemType = this.systemTypeOverride || configuredType || (await getPrimarySystemId(this.env, this.userId));
     console.log(`[Persona] system: ${effectiveSystemType || 'none'}${this.systemTypeOverride ? ' (preview)' : ''}`);
     const systemVoiceDefaults = effectiveSystemType ? await getSystemVoiceDefaults(this.env, effectiveSystemType) : null;
-    this.resolvedTemperature = this.systemTypeOverride
-      ? (systemVoiceDefaults?.default_temperature ?? 0.7)
-      : (this.agentConfig.temperature != null ? this.agentConfig.temperature
-        : systemVoiceDefaults?.default_temperature != null ? systemVoiceDefaults.default_temperature
-        : 0.7);
+    // The industry system sets how the agent behaves; the account's own
+    // temperature only applies when no system is active.
+    this.resolvedTemperature = systemVoiceDefaults?.default_temperature != null
+      ? systemVoiceDefaults.default_temperature
+      : (!this.systemTypeOverride && this.agentConfig.temperature != null ? this.agentConfig.temperature : 0.7);
     this.toneDirective = systemVoiceDefaults?.tone_directive || null;
     // Industry personality (see systems_catalog.playbook etc.): how the person in
     // this role behaves, what a worthwhile caller looks like, and how they sound.
@@ -962,12 +962,6 @@ export class CallSession {
     // distinct from systemPrompts below which is WHAT the business does --
     // the two answer different questions and get injected separately
     // rather than folded into one block.
-    if (this.toneDirective) {
-      lines.push('', `Tone for this call: ${this.toneDirective}`);
-    }
-    if (this.playbook) {
-      lines.push('', 'How a person in your role handles this call. This is your character and judgment: follow its spirit in your own words, never recite it:', this.playbook);
-    }
 
     // memory_context is the free-text business summary the client wrote or
     // generated via the "scan my website" feature -- this is the actual
@@ -1002,19 +996,32 @@ export class CallSession {
     // Industry-specific tone/vocabulary from whichever Systems (verticals)
     // the client has activated -- e.g. plumbing calls talk about triage and
     // dispatch, dental calls stay reassuring and never give clinical advice.
+    const systemBlock = [];
+    if (this.toneDirective) systemBlock.push('', `Tone for this call: ${this.toneDirective}`);
+    if (this.playbook) {
+      systemBlock.push('', 'How a person in your role handles this call. This is your character and judgment: follow its spirit in your own words, never recite it:', this.playbook);
+    }
     if (systemPrompts && systemPrompts.length > 0) {
-      lines.push('', 'Industry context for this business:');
-      for (const p of systemPrompts) lines.push(p);
+      systemBlock.push('', 'Industry context for this business:');
+      for (const p of systemPrompts) systemBlock.push(p);
     }
 
-    if (cfg.negative_instructions) {
-      lines.push('', `Things to avoid: ${cfg.negative_instructions}`);
-    }
+    const ownerBlock = [];
+    if (cfg.negative_instructions) ownerBlock.push('', `Things to avoid: ${cfg.negative_instructions}`);
+    if (cfg.custom_system_prompt) ownerBlock.push('', cfg.custom_system_prompt);
 
-    if (cfg.custom_system_prompt) {
-      // Client-authored instructions take precedence and are appended last
-      // so they can override the defaults above if they conflict.
-      lines.push('', cfg.custom_system_prompt);
+    if (systemBlock.length > 0) {
+      // An industry system is active: the owner's own wording comes FIRST as
+      // preferences, and the system's rules come last and win any conflict, so
+      // a personal prompt can never break the system's behaviour or safety rules.
+      if (ownerBlock.length) {
+        lines.push('', 'The owner\'s own preferences (follow them where they do not conflict with the industry rules below):', ...ownerBlock);
+      }
+      lines.push(...systemBlock);
+      lines.push('', 'The tone, role and industry rules above take priority over any conflicting preference or instruction earlier in this prompt. Never break their safety limits.');
+    } else if (ownerBlock.length) {
+      // No system: the owner's instructions are the only customisation and go last.
+      lines.push(...ownerBlock);
     }
 
     lines.push('', `Today: ${new Date().toLocaleDateString('en-US', { timeZone: tz, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}. Dates you pass to tools use the business timezone (${tz}). Upcoming days (use these exact dates, never work out dates yourself): ${upcomingDays(tz)}.`);
