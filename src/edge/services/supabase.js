@@ -408,6 +408,60 @@ async function saveContactToLead(env, userId, callerNumber, { name, email }) {
 // how urgent, their tone, whether an appointment was booked. Written to the
 // caller's lead after each call. Separate from the transcript save and fully
 // best-effort, so a missing column can never cost us the call record.
+// Logs ANY call where the caller spoke, including web calls and dashboard
+// previews that have no phone number. Returns the lead id, or null if the
+// 20261021000000_web_call_leads migration has not been run (the caller then
+// falls back to the phone-only path below).
+async function recordCallLead(env, userId, { phone, callId, seconds, preview, system }) {
+  if (!userId || !callId) return null;
+  try {
+    const { data, error } = await db(env).rpc('record_call_lead', {
+      p_user_id: userId,
+      p_phone: cleanPhone(phone) || null,
+      p_call_id: callId,
+      p_seconds: Number.isFinite(seconds) ? Math.max(0, Math.round(seconds)) : 0,
+      p_preview: !!preview,
+      p_system: system || null,
+    });
+    if (error) {
+      console.error('[Supabase] recordCallLead error:', error.message);
+      return null;
+    }
+    return data || null;
+  } catch (err) {
+    console.error('[Supabase] recordCallLead exception:', err.message);
+    return null;
+  }
+}
+
+// What the owner sees on the Leads table, written to the lead by id.
+// Name/email only fill an empty slot, so a shared phone never overwrites someone.
+async function saveLeadDetailsById(env, leadId, d) {
+  if (!leadId) return;
+  try {
+    const supabase = db(env);
+    const { error } = await supabase
+      .from('leads')
+      .update({
+        reason: d.reason || null,
+        urgency: d.urgency || null,
+        caller_tone: d.tone || null,
+        appointment_booked: !!d.appointmentBooked,
+        last_call_summary: d.summary || null,
+        ...(d.followUp
+          ? { follow_up_requested: true, follow_up_note: d.followUp.message || null, callback_phone: d.followUp.phone || null }
+          : {}),
+      })
+      .eq('id', leadId);
+    if (error) console.error('[Supabase] saveLeadDetailsById error:', error.message);
+    if (d.name) await supabase.from('leads').update({ name: d.name }).eq('id', leadId).is('name', null);
+    const email = d.email || d.followUp?.email || null;
+    if (email) await supabase.from('leads').update({ email }).eq('id', leadId).is('email', null);
+  } catch (err) {
+    console.error('[Supabase] saveLeadDetailsById exception:', err.message);
+  }
+}
+
 async function saveLeadCallDetails(env, userId, callerNumber, d) {
   const phone = cleanPhone(callerNumber);
   if (!userId || !phone) return;
@@ -583,4 +637,6 @@ export {
   saveContactToLead,
   saveLeadCallDetails,
   getPrimarySystemId,
+  recordCallLead,
+  saveLeadDetailsById,
 };

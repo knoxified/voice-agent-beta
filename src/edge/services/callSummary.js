@@ -6,10 +6,10 @@
 
 import { generateResponse } from './llm.js';
 
-export function decideOutcome({ callerSpoke, bookingConfirmed, questionsLogged }) {
+export function decideOutcome({ callerSpoke, bookingConfirmed, questionsLogged, followUp }) {
   if (!callerSpoke) return 'abandoned';
   if (bookingConfirmed) return 'booked';
-  if (questionsLogged > 0) return 'escalated';
+  if (questionsLogged > 0 || followUp) return 'escalated';
   return 'answered';
 }
 

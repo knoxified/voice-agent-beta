@@ -37,6 +37,27 @@ const MAX_QUESTIONS = 3; // per call
 // Offered on every turn: when the caller asks something the agent genuinely
 // cannot answer from its notes, it hands the question to the owner instead of
 // guessing. Costs nothing (no webhook).
+// Whenever the agent promises "the team will follow up / call you back", this
+// records it on the caller's lead, with a confirmed way to reach them.
+export const MESSAGE_TOOL = {
+  type: 'function',
+  function: {
+    name: 'take_message',
+    description:
+      'Use whenever you tell the caller the team will follow up, call them back, or send them something, or when they ask to leave a message. Call it BEFORE you say that. If you are not on a call with a phone number (a web call), you need their best phone number or email first: ask, read it back, get a yes. On a phone call the number they are calling from is already known, so do not ask for it.',
+    parameters: {
+      type: 'object',
+      properties: {
+        message: { type: 'string', description: 'What the team should follow up about, in one short sentence (for example "Jaw pain for 4 days, wants advice and a visit").' },
+        callback_phone: { type: 'string', description: 'Best number to reach them, ONLY if they gave one and you read it back.' },
+        callback_email: { type: 'string', description: 'Email to reach them, ONLY if they gave one and you read it back.' },
+        name: { type: 'string', description: "Caller's name, only if they said it." },
+      },
+      required: ['message'],
+    },
+  },
+};
+
 export const QUESTION_TOOL = {
   type: 'function',
   function: {
@@ -154,9 +175,43 @@ export async function executeTool(session, call) {
   if (name === 'check_availability') return runAvailability(session, args);
   if (name === 'book_appointment') return runBooking(session, args);
   if (name === 'take_question') return runTakeQuestion(session, args);
+  if (name === 'take_message') return runTakeMessage(session, args);
   return { ok: false, error: 'unknown_tool' };
 }
 
+
+async function runTakeMessage(session, args) {
+  const message = String(args.message || '').trim().slice(0, 300);
+  if (message.length < 4) {
+    return { ok: false, error: 'empty_message', instruction: 'Ask what they would like the team to follow up about.' };
+  }
+  const digits = String(args.callback_phone || '').replace(/\D/g, '');
+  const phone = digits.length >= 7 && digits.length <= 15 ? (String(args.callback_phone).trim().startsWith('+') ? '+' : '') + digits : '';
+  const email = String(args.callback_email || '').trim().toLowerCase();
+  const emailOk = EMAIL_RE.test(email) ? email : '';
+  const hasCallerId = !!(session.callerNumber && String(session.callerNumber).replace(/\D/g, '').length >= 6);
+
+  if (!phone && !emailOk && !hasCallerId) {
+    return {
+      ok: false,
+      error: 'need_contact',
+      instruction: 'You have no way to reach them yet. Ask for the best phone number or email, read it back digit by digit or letter by letter, and call this again once they say yes.',
+    };
+  }
+  session.followUp = {
+    message,
+    phone: phone || null,
+    email: emailOk || null,
+    name: String(args.name || '').trim().slice(0, 80) || null,
+  };
+  return {
+    ok: true,
+    noted: true,
+    instruction: hasCallerId && !phone && !emailOk
+      ? 'Tell them, naturally, that you have noted it and the team will call them back on the number they are calling from. Then continue.'
+      : 'Tell them, naturally, that you have noted it and the team will reach out on the contact they gave. Then continue.',
+  };
+}
 
 async function runTakeQuestion(session, args) {
   const question = String(args.question || '').trim();

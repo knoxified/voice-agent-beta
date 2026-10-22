@@ -48,7 +48,7 @@ async function generateResponse(env, messages, temperature = 0.7) {
 // tool call (Groq rejects it with tool_use_failed), retry once without tools
 // so the caller still gets a spoken answer instead of silence.
 async function generateWithTools(env, messages, temperature = 0.7, tools = null) {
-  const groq = new Groq({ apiKey: env.GROQ_API_KEY });
+  const groq = new Groq({ apiKey: env.GROQ_API_KEY, maxRetries: 1, timeout: 8000 });
   const MODEL = env.GROQ_MODEL || 'openai/gpt-oss-20b';
   const reasoningModel = isReasoningModel(MODEL);
 
@@ -124,7 +124,8 @@ function takeSentences(buf) {
 }
 
 async function streamWithTools(env, messages, temperature = 0.7, tools = null, onSentence = () => {}) {
-  const groq = new Groq({ apiKey: env.GROQ_API_KEY });
+  // A live call can't wait: give up after 7s (no hidden retry backoff) and let the caller's turn fall back.
+  const groq = new Groq({ apiKey: env.GROQ_API_KEY, maxRetries: 0, timeout: 7000 });
   const MODEL = env.GROQ_MODEL || 'openai/gpt-oss-20b';
   const reasoningModel = isReasoningModel(MODEL);
 

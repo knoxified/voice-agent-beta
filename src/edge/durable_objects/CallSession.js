@@ -1,7 +1,7 @@
 import { createLiveTranscription, sendAudio as sendToDeepgram, keepAlive } from '../services/stt.js';
 import { generateWithTools, streamWithTools } from '../services/llm.js';
 import { synthesizeSpeech, streamSpeech, EMOTIONS } from '../services/tts.js';
-import { TOOL_DEFS, QUESTION_TOOL, executeTool, businessTimeZone } from '../services/tools.js';
+import { TOOL_DEFS, QUESTION_TOOL, MESSAGE_TOOL, executeTool, businessTimeZone } from '../services/tools.js';
 import { decideOutcome, buildCallSummary } from '../services/callSummary.js';
 import { classifyStage } from '../services/qualifier.js';
 import { parseDayMention, parseTimeMention, matchSlot, dayLabel } from '../services/scheduling.js';
@@ -14,6 +14,8 @@ import { getKnownCaller, saveContactToLead, saveLeadCallDetails,
   getEnabledSystemPrompts,
   getSystemVoiceDefaults,
   getPrimarySystemId,
+  recordCallLead,
+  saveLeadDetailsById,
   getRemainingMinutes,
   deductSeconds,
   saveCallTranscript,
@@ -80,6 +82,8 @@ export class CallSession {
     this.knownCaller = null;
     this.capturedContact = null;
     this.questionsLogged = 0;
+    this.followUp = null; // set by take_message: { message, phone, email, name }
+    this.effectiveSystemType = null;
     this.callerTurns = 0;
 
     // Silence handling: ask "still there?" after SILENCE_PROMPT, hang up
@@ -325,6 +329,7 @@ export class CallSession {
     // system (system_type defaults to 'general' and matches nothing).
     const configuredType = this.agentConfig.system_type && this.agentConfig.system_type !== 'general' ? this.agentConfig.system_type : null;
     const effectiveSystemType = this.systemTypeOverride || configuredType || (await getPrimarySystemId(this.env, this.userId));
+    this.effectiveSystemType = effectiveSystemType || null;
     console.log(`[Persona] system: ${effectiveSystemType || 'none'}${this.systemTypeOverride ? ' (preview)' : ''}`);
     const systemVoiceDefaults = effectiveSystemType ? await getSystemVoiceDefaults(this.env, effectiveSystemType) : null;
     // The industry system sets how the agent behaves; the account's own
@@ -455,7 +460,7 @@ export class CallSession {
       let finalSpeaker = null;
 
       for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
-        const toolList = round < MAX_TOOL_ROUNDS ? (this.actionUnlocked ? [...TOOL_DEFS, QUESTION_TOOL] : [QUESTION_TOOL]) : null;
+        const toolList = round < MAX_TOOL_ROUNDS ? (this.actionUnlocked ? [...TOOL_DEFS, QUESTION_TOOL, MESSAGE_TOOL] : [QUESTION_TOOL, MESSAGE_TOOL]) : null;
 
         // Speak each sentence as the model writes it, so the first words reach
         // the caller while the rest is still being generated. If streaming
@@ -467,6 +472,7 @@ export class CallSession {
         } catch (err) {
           if (speaker.count() > 0) throw err;
           console.warn('[LLM] stream failed, using one-shot:', err.message);
+          if (/timed? ?out|timeout/i.test(String(err.message))) await this.speakFiller('Sorry, give me one second.');
           result = await generateWithTools(this.env, working, this.resolvedTemperature, toolList);
         }
         await speaker.drain();
@@ -728,9 +734,9 @@ export class CallSession {
       } else if (this.stage === 'agreed') {
         hints.push(this.agreedHint());
       } else if (this.stage === 'declined') {
-        hints.push('Stage: the caller does not want a next step right now. Do not push. Offer to take a message or send information if useful, then close warmly.');
+        hints.push('Stage: the caller does not want a next step right now. Do not push. Keep helping with what they asked, offer to take a message or send information if useful, and let THEM decide when the call is over. Do not wrap up on your own.');
       } else if (this.stage === 'not_fit') {
-        hints.push('Stage: this does not look like something the business can help with. Be polite, briefly say so, and wrap up.');
+        hints.push('Stage: you may have misjudged this call. Do not wrap up or end it. Ask one gentle question to understand what they need. If it truly is something the business cannot do, say so kindly, point them to the right kind of help, offer to take a message, and stay on the line until they are done.');
       }
     }
 
@@ -936,6 +942,10 @@ export class CallSession {
       '- Never open with praise or filler like "Great question" or "Absolutely". Only state facts about the business that are in your notes; otherwise say you will check with the team.',
       '- Emotion: you may begin a reply with ONE marker when the moment clearly calls for it: [mood:sympathetic] (caller in pain, worried or upset), [mood:enthusiastic] (good news or excitement), [mood:calm] (tense or urgent), [mood:apologetic] (something went wrong), [mood:curious], [mood:confident], [mood:content]. Use it only when it fits, not on every reply, and never mention it.',
       '- If you do not know something, say so plainly and offer to have someone follow up.',
+      '- If someone starts to give their name but you did not catch it (cut off or unclear), say so naturally and ask once, for example "Sorry, I missed your name, could you say it again?". Never carry on as if you heard it.',
+      '- Never decide a caller is out of scope on your own. Ask what they mean first. Never say "that is outside our scope" or "take care" as a way to wrap up, and never offer to end the call. Only say goodbye once the caller is wrapping up.',
+      '- Whenever you say the team will follow up, call them back or send something, first use take_message. On a web call you have no phone number: ask for the best number or email, read it back, get a yes, then use it. On a phone call you already have their number, so do not ask for it.',
+      '- If someone says "help" or sounds distressed, slow down, say something caring, and ask what is happening before anything else.',
       '- Ending the call: when the caller has clearly finished (says bye, thanks that is all, nothing else) give one short warm goodbye and put the exact marker [END] at the very end of that final message. Use [END] only for that final goodbye, never mid-conversation, and never mention it. Do not offer more help after they have said they are done.',
       '- You are an AI and the greeting already said so. Never pretend to be human, and if someone sincerely asks whether you are a person, tell them the truth in one calm sentence and carry on.',
     ];
@@ -1059,6 +1069,7 @@ export class CallSession {
         callerSpoke,
         bookingConfirmed: !!this.bookingConfirmed,
         questionsLogged: this.questionsLogged,
+        followUp: !!this.followUp,
       });
       const analysis = await buildCallSummary(this.env, { messages: this.messages, outcome });
       const summary = analysis.summary;
@@ -1075,20 +1086,34 @@ export class CallSession {
       );
 
       if (callerSpoke) {
-        await recordInboundLead(this.env, this.userId, this.callerNumber, this.callId);
-        // A name/email the caller confirmed for a booking always wins; a name they
-        // simply said during the call fills in only when nothing else is known.
-        await saveContactToLead(this.env, this.userId, this.callerNumber, {
-          name: this.capturedContact?.name || analysis.name,
-          email: this.capturedContact?.email || null,
-        });
-        await saveLeadCallDetails(this.env, this.userId, this.callerNumber, {
+        // Every call where the caller spoke is logged on the Leads page, including web
+        // calls and dashboard previews (no phone number). A name/email the caller
+        // confirmed for a booking wins; a name they simply said only fills an empty slot.
+        const detail = {
           reason: analysis.reason,
           urgency: analysis.urgency,
           tone: analysis.tone,
           summary,
           appointmentBooked: outcome === 'booked',
+          name: this.capturedContact?.name || this.followUp?.name || analysis.name,
+          email: this.capturedContact?.email || null,
+          followUp: this.followUp,
+        };
+        const leadId = await recordCallLead(this.env, this.userId, {
+          phone: this.callerNumber,
+          callId: this.callId,
+          seconds: durationSecs,
+          preview: !!this.systemTypeOverride,
+          system: this.effectiveSystemType,
         });
+        if (leadId) {
+          await saveLeadDetailsById(this.env, leadId, detail);
+        } else if (this.callerNumber) {
+          // record_call_lead not migrated yet: original phone-only path.
+          await recordInboundLead(this.env, this.userId, this.callerNumber, this.callId);
+          await saveContactToLead(this.env, this.userId, this.callerNumber, { name: detail.name, email: detail.email });
+          await saveLeadCallDetails(this.env, this.userId, this.callerNumber, detail);
+        }
       }
     }
 

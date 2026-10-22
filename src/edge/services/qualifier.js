@@ -20,7 +20,8 @@ Stages:
 - declined: the caller turned the next step down, or only wants information.
 - not_fit: wrong number, spam, unrelated to the business, or abusive.
 
-Be strict. Small talk or one vague mention is "discover". Choose "agreed" only if the agent proposed the step first and the caller said yes.`;
+Be strict. Small talk or one vague mention is "discover". Choose "agreed" only if the agent proposed the step first and the caller said yes.
+Be slow to choose "not_fit": use it only for a wrong number, spam, abuse, or something clearly unrelated AFTER the caller has had a chance to explain. A symptom, problem or request that could plausibly relate to the business (for example jaw, face or chewing pain for a dental practice) is "discover" or "qualified", never "not_fit".`;
 
 export async function classifyStage(env, messages, { businessName, criteria } = {}) {
   const convo = messages
@@ -30,7 +31,7 @@ export async function classifyStage(env, messages, { businessName, criteria } = 
     .join('\n');
   if (!convo) return null;
 
-  const groq = new Groq({ apiKey: env.GROQ_API_KEY });
+  const groq = new Groq({ apiKey: env.GROQ_API_KEY, maxRetries: 0, timeout: 6000 });
   // Same brain as the conversation by default: it is the one model we know is
   // live on this account. Override with GROQ_CLASSIFIER_MODEL if you add a faster one.
   const model = env.GROQ_CLASSIFIER_MODEL || env.GROQ_MODEL || 'openai/gpt-oss-20b';
