@@ -1,5 +1,62 @@
 import Groq from 'groq-sdk';
 
+// ── Rate-limit helpers ────────────────────────────────────────────────────────
+
+// Groq 429 messages say "Please try again in 5.3s." — pull that number out.
+function parseRetryAfterMs(err) {
+  const msg = String(err?.message || err?.error?.message || '');
+  const m = msg.match(/try again in ([\d.]+)s/i);
+  return m ? Math.ceil(parseFloat(m[1]) * 1000) : null;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ── Cloudflare Workers AI fallback (same model, separate quota) ───────────────
+// Used when Groq returns 429 and the wait is too long (or a second 429 fires).
+// env.AI binding is wired in wrangler.jsonc under "ai": { "binding": "AI" }.
+
+async function callCloudflareFallback(env, messages, tools, maxTokens) {
+  if (!env?.AI) throw new Error('[CF] AI binding not available');
+
+  const payload = {
+    messages,
+    max_tokens: maxTokens || 300,
+    stream: false,
+  };
+  if (tools?.length) {
+    payload.tools = tools;
+    payload.tool_choice = 'auto';
+    payload.parallel_tool_calls = false;
+  }
+
+  const out = await env.AI.run('@cf/openai/gpt-oss-20b', payload);
+  const cfContent = out?.response?.trim() || null;
+
+  // Cloudflare returns tool_calls with arguments as an object (not a JSON
+  // string), so normalise to the OpenAI shape the rest of the code expects.
+  let cfToolCalls = null;
+  if (Array.isArray(out?.tool_calls) && out.tool_calls.length) {
+    cfToolCalls = out.tool_calls.map((tc, i) => ({
+      id: `cf_${i}`,
+      type: 'function',
+      function: {
+        name: tc.name,
+        arguments: typeof tc.arguments === 'string'
+          ? tc.arguments
+          : JSON.stringify(tc.arguments ?? {}),
+      },
+    }));
+  }
+
+  return {
+    content: cfContent,
+    toolCalls: cfToolCalls,
+    assistantMessage: cfToolCalls
+      ? { role: 'assistant', content: cfContent, tool_calls: cfToolCalls }
+      : null,
+  };
+}
+
 // openai/gpt-oss-* are reasoning models: they spend part of the token budget
 // on an internal reasoning step before writing the final answer into
 // `content`. With a small budget that reasoning step alone can consume the
@@ -77,6 +134,26 @@ async function generateWithTools(env, messages, temperature = 0.7, tools = null)
     if (tools && (msg.includes('tool_use_failed') || msg.includes('Failed to call a function'))) {
       console.warn('[LLM] tool_use_failed, retrying without tools');
       completion = await groq.chat.completions.create(build(false));
+    } else if (err?.status === 429) {
+      // Rate-limit: wait the exact retry-after window if short, then try once
+      // more on Groq; otherwise go straight to the Cloudflare fallback.
+      const waitMs = parseRetryAfterMs(err);
+      if (waitMs && waitMs <= 2000) {
+        console.warn(`[LLM] 429 — waiting ${waitMs}ms then retrying Groq`);
+        await sleep(waitMs);
+        try {
+          completion = await groq.chat.completions.create(build(true));
+        } catch (err2) {
+          if (err2?.status === 429) {
+            console.warn('[LLM] 429 again — falling back to Cloudflare');
+            return callCloudflareFallback(env, messages, tools, build(true).max_tokens);
+          }
+          throw err2;
+        }
+      } else {
+        console.warn('[LLM] 429 long wait — falling back to Cloudflare');
+        return callCloudflareFallback(env, messages, tools, build(true).max_tokens);
+      }
     } else {
       console.error('[LLM] Groq error:', msg);
       throw err;
@@ -143,7 +220,16 @@ async function streamWithTools(env, messages, temperature = 0.7, tools = null, o
     params.parallel_tool_calls = false;
   }
 
-  const stream = await groq.chat.completions.create(params);
+  let stream;
+  try {
+    stream = await groq.chat.completions.create(params);
+  } catch (err) {
+    if (err?.status === 429) {
+      console.warn('[LLM] stream 429 — falling back to Cloudflare (non-streaming)');
+      return callCloudflareFallback(env, messages, tools, params.max_tokens);
+    }
+    throw err;
+  }
 
   let full = '';
   let pending = '';

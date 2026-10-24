@@ -379,6 +379,9 @@ export class CallSession {
             while (next && !this.ending) {
               this.queuedTranscript = '';
               await this.processTurn(next);
+              // Coalesce: give rapid follow-on fragments ("Hello?" "Can you hear me?")
+              // a 250 ms window to arrive before we fire another LLM turn.
+              if (this.queuedTranscript) await new Promise((r) => setTimeout(r, 250));
               next = this.queuedTranscript;
             }
           } finally {
