@@ -375,6 +375,11 @@ export class CallSession {
           }
           this.isProcessing = true;
           try {
+            // Push the user's words to the browser transcript panel immediately.
+            if (this.ws?.readyState === 1) {
+              this.ws.send(JSON.stringify({ event: 'transcript', role: 'user', text: transcript }));
+            }
+
             let next = transcript;
             while (next && !this.ending) {
               this.queuedTranscript = '';
@@ -531,6 +536,11 @@ export class CallSession {
       }
 
       this.pushAssistant(aiText);
+
+      // Push the agent's reply text to the browser transcript panel.
+      if (this.ws?.readyState === 1) {
+        this.ws.send(JSON.stringify({ event: 'transcript', role: 'agent', text: aiText }));
+      }
 
       const spokeAt = streamedFinal ? turnStart : Date.now();
       if (!streamedFinal) await this.speak(aiText, { mood });

@@ -26,7 +26,7 @@
     "binding": "AI"
   },
   "vars": {
-    "GROQ_CLASSIFIER_MODEL": "meta-llama/llama-4-scout-17b-16e-instruct",
+    "GROQ_CLASSIFIER_MODEL": "llama-3.3-70b-versatile",
     "TWILIO_TWIML_APP_SID": "AP37499d8dc8149959ed68910df75083ad",
     "CARTESIA_VOICE_ID_DEFAULT": "e07c00bc-4134-4eae-9ea4-1a55fb45746b",
     "PORT": "3000",

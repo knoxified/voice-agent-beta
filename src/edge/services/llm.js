@@ -15,11 +15,40 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Used when Groq returns 429 and the wait is too long (or a second 429 fires).
 // env.AI binding is wired in wrangler.jsonc under "ai": { "binding": "AI" }.
 
+/**
+ * Cloudflare Workers AI binding requires message content to be a plain string.
+ * The Groq conversation history can have:
+ *   - content as an array (multi-part messages)
+ *   - content as null (assistant messages that only made tool calls)
+ *   - role 'tool' (tool results — CF binding doesn't support this role)
+ * Strip or flatten all of these before sending.
+ */
+function sanitizeForCF(messages) {
+  return messages.reduce((acc, msg) => {
+    const role = msg.role;
+    if (!['system', 'user', 'assistant'].includes(role)) return acc;
+
+    let content;
+    if (Array.isArray(msg.content)) {
+      content = msg.content.filter(c => c?.type === 'text').map(c => c.text).join(' ').trim();
+    } else if (msg.content === null || msg.content === undefined) {
+      if (msg.tool_calls?.length) return acc; // tool-call-only assistant turn — skip
+      content = '';
+    } else {
+      content = String(msg.content);
+    }
+
+    if (role === 'assistant' && !content) return acc;
+    acc.push({ role, content });
+    return acc;
+  }, []);
+}
+
 async function callCloudflareFallback(env, messages, tools, maxTokens) {
   if (!env?.AI) throw new Error('[CF] AI binding not available');
 
   const payload = {
-    messages,
+    messages: sanitizeForCF(messages),
     max_tokens: maxTokens || 300,
     stream: false,
   };
