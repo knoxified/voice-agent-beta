@@ -395,7 +395,7 @@ export class CallSession {
         },
         (err) => console.error('[STT] Connection error:', err.message || err),
         (text) => this.markCallerActivity(text),
-        { ...this.sttFormat, keyterms: this.buildKeyterms() }
+        { ...this.sttFormat, keyterms: this.buildKeyterms(), utteranceEndMs: Number(this.env.STT_UTTERANCE_END_MS || 600) }
       );
       console.log('[Stream] Deepgram WebSocket connected');
     } catch (err) {
@@ -499,9 +499,17 @@ export class CallSession {
             await this.speakFiller(result.content || pickFiller(first));
           }
 
-          for (const call of result.toolCalls) {
-            const out = await executeTool(this, call);
-            console.log(`[Tool] ${call.function?.name} ->`, JSON.stringify(out));
+          // Run all tool calls in parallel — most turns only have one, but
+          // parallel execution eliminates any wait when the model stacks two.
+          const toolResults = await Promise.all(
+            result.toolCalls.map((call) =>
+              executeTool(this, call).then((out) => {
+                console.log(`[Tool] ${call.function?.name} ->`, JSON.stringify(out));
+                return { call, out };
+              })
+            )
+          );
+          for (const { call, out } of toolResults) {
             working.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(out) });
           }
           continue;

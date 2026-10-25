@@ -31,7 +31,7 @@ export async function classifyStage(env, messages, { businessName, criteria } = 
     .join('\n');
   if (!convo) return null;
 
-  const groq = new Groq({ apiKey: env.GROQ_API_KEY, maxRetries: 0, timeout: 6000 });
+  const groq = new Groq({ apiKey: env.GROQ_API_KEY, maxRetries: 0, timeout: 3000 });
   // Same brain as the conversation by default: it is the one model we know is
   // live on this account. Override with GROQ_CLASSIFIER_MODEL if you add a faster one.
   const model = env.GROQ_CLASSIFIER_MODEL || env.GROQ_MODEL || 'openai/gpt-oss-20b';
@@ -51,7 +51,7 @@ export async function classifyStage(env, messages, { businessName, criteria } = 
   else params.response_format = { type: 'json_object' };
 
   const call = groq.chat.completions.create(params);
-  const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('classifier timeout')), 6000));
+  const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('classifier timeout')), 3000));
 
   try {
     const res = await Promise.race([call, timeout]);

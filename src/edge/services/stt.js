@@ -30,7 +30,7 @@ function buildDeepgramUrl(opts = {}) {
     punctuate: 'true',
     interim_results: 'true',
     endpointing: String(opts.endpointingMs || 300),
-    utterance_end_ms: '1000',
+    utterance_end_ms: String(opts.utteranceEndMs || 600),
     vad_events: 'true',
   });
   if (encoding === 'linear16') params.set('channels', '1');
