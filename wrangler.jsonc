@@ -27,6 +27,9 @@
   },
   "vars": {
     "GROQ_CLASSIFIER_MODEL": "llama-3.3-70b-versatile",
+    "DEMO_USER_ID": "5586b150-de37-4002-ac30-e44e6662c442",
+    "BREVO_SENDER_EMAIL": "no-reply@mail.knoxified.org",
+    "BREVO_SENDER_NAME": "Knoxified",
     "TWILIO_TWIML_APP_SID": "AP37499d8dc8149959ed68910df75083ad",
     "CARTESIA_VOICE_ID_DEFAULT": "e07c00bc-4134-4eae-9ea4-1a55fb45746b",
     "PORT": "3000",

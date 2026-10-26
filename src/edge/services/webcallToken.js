@@ -34,11 +34,12 @@ async function hmacKey(env, usage) {
   return crypto.subtle.importKey('raw', enc.encode(secretFor(env)), { name: 'HMAC', hash: 'SHA-256' }, false, [usage]);
 }
 
-export async function signWebcallToken(env, { userId, callId, systemTypeOverride = '' }, ttlSeconds = 2 * 60 * 60) {
+export async function signWebcallToken(env, { userId, callId, systemTypeOverride = '', isDemo = false }, ttlSeconds = 2 * 60 * 60) {
   const payload = {
     u: userId,
     c: callId,
     s: systemTypeOverride || '',
+    ...(isDemo ? { d: 1 } : {}),
     e: Math.floor(Date.now() / 1000) + ttlSeconds,
   };
   const body = toB64Url(enc.encode(JSON.stringify(payload)));
@@ -56,7 +57,7 @@ export async function verifyWebcallToken(env, token, expectedCallId) {
     const p = JSON.parse(new TextDecoder().decode(fromB64Url(body)));
     if (!p.u || !p.c || p.c !== expectedCallId) return null;
     if (!p.e || p.e < Math.floor(Date.now() / 1000)) return null;
-    return { userId: p.u, callId: p.c, systemTypeOverride: p.s || '' };
+    return { userId: p.u, callId: p.c, systemTypeOverride: p.s || '', isDemo: p.d === 1 };
   } catch {
     return null;
   }

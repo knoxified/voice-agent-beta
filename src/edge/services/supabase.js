@@ -578,7 +578,7 @@ async function getSystemVoiceDefaults(env, systemType) {
   try {
     let { data, error } = await supabase
       .from('systems_catalog')
-      .select('default_temperature, tone_directive, voice_id, playbook, qualification_criteria, speech_speed, speech_emotion')
+      .select('name, default_temperature, tone_directive, voice_id, playbook, qualification_criteria, speech_speed, speech_emotion')
       .eq('id', systemType)
       .maybeSingle();
 
@@ -586,7 +586,7 @@ async function getSystemVoiceDefaults(env, systemType) {
     if (error && /playbook|qualification_criteria|speech_|does not exist|could not find/i.test(error.message || '')) {
       ({ data, error } = await supabase
         .from('systems_catalog')
-        .select('default_temperature, tone_directive, voice_id')
+        .select('name, default_temperature, tone_directive, voice_id')
         .eq('id', systemType)
         .maybeSingle());
     }

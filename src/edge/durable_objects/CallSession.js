@@ -49,6 +49,8 @@ export class CallSession {
     this.dgWs = null;
     this.keepAliveTimer = null;
     this.isProcessing = false;
+    this.isDemo = false;
+    this.demoStartedAt = null;
 
     this.callStartedAt = null;
     this.remainingMinutesAtStart = null;
@@ -297,64 +299,99 @@ export class CallSession {
 
     this.callStartedAt = Date.now();
 
-    const user = await getUserById(this.env, this.userId);
-    this.isTrial = user?.isTrial || false;
-    console.log(`[Stream] User loaded | isTrial: ${this.isTrial}`);
+    // Demo flag comes from the verified token via index.js — never from raw
+    // query params the browser could forge.
+    const callUrl = new URL(c.req.url);
+    if (callUrl.searchParams.get('isDemo') === '1') {
+      this.isDemo = true;
+      this.demoStartedAt = Date.now();
+    }
 
-    const [voiceSettings, agentConfig, systemPrompts, knownCaller] = await Promise.all([
-      getUserVoiceSettings(this.env, this.userId),
-      getAgentConfig(this.env, this.userId),
-      getEnabledSystemPrompts(this.env, this.userId, this.systemTypeOverride || null),
-      this.isWebCall ? null : getKnownCaller(this.env, this.userId, this.callerNumber),
-    ]);
-    this.knownCaller = knownCaller;
+    const user = await getUserById(this.env, this.userId);
+    this.isTrial = this.isDemo ? false : (user?.isTrial || false);
+    console.log(`[Stream] User loaded | isTrial: ${this.isTrial}${this.isDemo ? ' | DEMO' : ''}`);
+
+    let voiceSettings, agentConfig, systemPrompts;
+
+    if (this.isDemo) {
+      // Demo: load industry defaults only — skip user config, FAQs, website summary.
+      const [vs, systemVoiceDefaults] = await Promise.all([
+        getUserVoiceSettings(this.env, this.userId),
+        getSystemVoiceDefaults(this.env, this.systemTypeOverride),
+      ]);
+      voiceSettings = vs;
+      systemPrompts = null;
+      const industryName = systemVoiceDefaults?.name || this.systemTypeOverride || 'Business';
+      agentConfig = {
+        organization_name: `Knoxified ${industryName}`,
+        agent_nickname: 'Alex',
+        system_type: this.systemTypeOverride,
+        main_call_to_action: 'schedule a visit or appointment',
+        require_ai_disclosure: true,
+        call_recording_enabled: false,
+      };
+      this.routingRules = [];
+      this.transferNumber = null;
+      this.effectiveSystemType = this.systemTypeOverride;
+      this.resolvedTemperature = systemVoiceDefaults?.default_temperature ?? 0.7;
+      this.toneDirective = systemVoiceDefaults?.tone_directive || null;
+      this.playbook = systemVoiceDefaults?.playbook || null;
+      this.qualificationCriteria = systemVoiceDefaults?.qualification_criteria || null;
+      this.speechSpeed = Number(systemVoiceDefaults?.speech_speed) || null;
+      this.speechEmotion = systemVoiceDefaults?.speech_emotion || null;
+      const PLATFORM_DEFAULT = this.env.CARTESIA_VOICE_ID_DEFAULT || 'e07c00bc-4134-4eae-9ea4-1a55fb45746b';
+      this.voiceId = systemVoiceDefaults?.voice_id || vs.preferred_voice_id || PLATFORM_DEFAULT;
+      this.remainingMinutesAtStart = 999;
+      this.knownCaller = null;
+      console.log(`[Demo] industry: ${this.systemTypeOverride} | company: ${agentConfig.organization_name} | voice: ${this.voiceId}`);
+    } else {
+      [voiceSettings, agentConfig, systemPrompts] = await Promise.all([
+        getUserVoiceSettings(this.env, this.userId),
+        getAgentConfig(this.env, this.userId),
+        getEnabledSystemPrompts(this.env, this.userId, this.systemTypeOverride || null),
+      ]);
+      this.knownCaller = this.isWebCall ? null : await getKnownCaller(this.env, this.userId, this.callerNumber);
+    }
+
     this.quotaExceededMessage = voiceSettings.quota_exceeded_message;
-    this.voiceId = voiceSettings.preferred_voice_id;
+    this.voiceId = this.voiceId || voiceSettings.preferred_voice_id;
     this.agentConfig = agentConfig || {};
 
-    // Routing rules never apply to the per-system preview widget -- that's
-    // for hearing a vertical's default voice, not this account's own setup.
-    this.routingRules = this.systemTypeOverride ? [] : sanitizeRules(this.agentConfig.custom_intents, (systemPrompts || []).length > 0);
-    this.transferNumber = isValidE164(this.agentConfig.business_phone) ? this.agentConfig.business_phone : null;
+    if (!this.isDemo) {
+      this.routingRules = this.systemTypeOverride ? [] : sanitizeRules(this.agentConfig.custom_intents, (systemPrompts || []).length > 0);
+      this.transferNumber = isValidE164(this.agentConfig.business_phone) ? this.agentConfig.business_phone : null;
+    }
     this.voiceSettingsGreeting = voiceSettings.agent_greeting;
 
-    // System-vertical voice defaults (temperature + tone). Preview mode
-    // (systemTypeOverride set, from the per-system preview widget) always
-    // uses the previewed vertical's own default -- that's the entire
-    // point, hearing how THAT system sounds, regardless of this account's
-    // own temperature override. A normal call still respects the
-    // account's own explicit override first.
-    // Which industry personality applies: a previewed system first, then an
-    // explicit system_type on the account, then the account's own enabled
-    // system (system_type defaults to 'general' and matches nothing).
-    const configuredType = this.agentConfig.system_type && this.agentConfig.system_type !== 'general' ? this.agentConfig.system_type : null;
-    const effectiveSystemType = this.systemTypeOverride || configuredType || (await getPrimarySystemId(this.env, this.userId));
-    this.effectiveSystemType = effectiveSystemType || null;
-    console.log(`[Persona] system: ${effectiveSystemType || 'none'}${this.systemTypeOverride ? ' (preview)' : ''}`);
-    const systemVoiceDefaults = effectiveSystemType ? await getSystemVoiceDefaults(this.env, effectiveSystemType) : null;
-    // The industry system sets how the agent behaves; the account's own
-    // temperature only applies when no system is active.
-    this.resolvedTemperature = systemVoiceDefaults?.default_temperature != null
-      ? systemVoiceDefaults.default_temperature
-      : (!this.systemTypeOverride && this.agentConfig.temperature != null ? this.agentConfig.temperature : 0.7);
-    this.toneDirective = systemVoiceDefaults?.tone_directive || null;
-    // Industry personality (see systems_catalog.playbook etc.): how the person in
-    // this role behaves, what a worthwhile caller looks like, and how they sound.
-    this.playbook = systemVoiceDefaults?.playbook || null;
-    this.qualificationCriteria = systemVoiceDefaults?.qualification_criteria || null;
-    this.speechSpeed = Number(systemVoiceDefaults?.speech_speed) || null;
-    this.speechEmotion = systemVoiceDefaults?.speech_emotion || null;
+    if (!this.isDemo) {
+      // System-vertical voice defaults (temperature + tone). Preview mode
+      // (systemTypeOverride set, from the per-system preview widget) always
+      // uses the previewed vertical's own default -- that's the entire
+      // point, hearing how THAT system sounds, regardless of this account's
+      // own temperature override. A normal call still respects the
+      // account's own explicit override first.
+      const configuredType = this.agentConfig.system_type && this.agentConfig.system_type !== 'general' ? this.agentConfig.system_type : null;
+      const effectiveSystemType = this.systemTypeOverride || configuredType || (await getPrimarySystemId(this.env, this.userId));
+      this.effectiveSystemType = effectiveSystemType || null;
+      console.log(`[Persona] system: ${effectiveSystemType || 'none'}${this.systemTypeOverride ? ' (preview)' : ''}`);
+      const systemVoiceDefaults = effectiveSystemType ? await getSystemVoiceDefaults(this.env, effectiveSystemType) : null;
+      this.resolvedTemperature = systemVoiceDefaults?.default_temperature != null
+        ? systemVoiceDefaults.default_temperature
+        : (!this.systemTypeOverride && this.agentConfig.temperature != null ? this.agentConfig.temperature : 0.7);
+      this.toneDirective = systemVoiceDefaults?.tone_directive || null;
+      this.playbook = systemVoiceDefaults?.playbook || null;
+      this.qualificationCriteria = systemVoiceDefaults?.qualification_criteria || null;
+      this.speechSpeed = Number(systemVoiceDefaults?.speech_speed) || null;
+      this.speechEmotion = systemVoiceDefaults?.speech_emotion || null;
 
-    // Voice resolution: a previewed system always uses its own vertical voice.
-    // On a normal call, an account that explicitly picked a voice keeps it;
-    // otherwise (still on the platform default) the account's system voice applies.
-    const PLATFORM_DEFAULT_VOICE = this.env.CARTESIA_VOICE_ID_DEFAULT || 'e07c00bc-4134-4eae-9ea4-1a55fb45746b';
-    const systemVoice = systemVoiceDefaults?.voice_id || null;
-    const accountPickedVoice = voiceSettings.preferred_voice_id && voiceSettings.preferred_voice_id !== PLATFORM_DEFAULT_VOICE && voiceSettings.preferred_voice_id !== 'e07c00bc-4134-4eae-9ea4-1a55fb45746b';
-    if (this.systemTypeOverride) this.voiceId = systemVoice || this.voiceId;
-    else if (!accountPickedVoice && systemVoice) this.voiceId = systemVoice;
+      const PLATFORM_DEFAULT_VOICE = this.env.CARTESIA_VOICE_ID_DEFAULT || 'e07c00bc-4134-4eae-9ea4-1a55fb45746b';
+      const systemVoice = systemVoiceDefaults?.voice_id || null;
+      const accountPickedVoice = voiceSettings.preferred_voice_id && voiceSettings.preferred_voice_id !== PLATFORM_DEFAULT_VOICE && voiceSettings.preferred_voice_id !== 'e07c00bc-4134-4eae-9ea4-1a55fb45746b';
+      if (this.systemTypeOverride) this.voiceId = systemVoice || this.voiceId;
+      else if (!accountPickedVoice && systemVoice) this.voiceId = systemVoice;
 
-    this.remainingMinutesAtStart = await getRemainingMinutes(this.env, this.userId);
+      this.remainingMinutesAtStart = await getRemainingMinutes(this.env, this.userId);
+    }
 
     this.messages = [
       { role: 'system', content: this.buildSystemPrompt(voiceSettings, agentConfig, systemPrompts) },
@@ -427,6 +464,13 @@ export class CallSession {
   }
 
   async processTurn(transcript) {
+    // Demo hard cut: 100 s max — speak a one-line goodbye and hang up.
+    if (this.isDemo && this.demoStartedAt && Date.now() - this.demoStartedAt > 100_000) {
+      console.log('[Demo] 100 s hard cut');
+      await this.speak('Thanks for trying Knoxified! Get your own agent at knoxified dot org. Goodbye!');
+      await this.hangUpAfterPlayback();
+      return;
+    }
     const turnStart = Date.now();
     console.log(`[STT] "${transcript}"`);
 
@@ -773,6 +817,18 @@ export class CallSession {
       hints.push('The call has gone on long without a clear next step. Wrap up now: offer to take a message, have the team follow up, or send information, then close warmly. Do not start new topics.');
     } else if (this.callerTurns >= softTurns || elapsedSecs >= softSecs) {
       hints.push('You have talked a while. If the caller has a real, specific need you can help with, make your soft next-step suggestion now. If not, start steering toward taking a message or closing politely.');
+    }
+
+    // Demo wind-down: at 85 s prompt a natural product mention + close.
+    if (this.isDemo && this.demoStartedAt) {
+      const demoSec = (Date.now() - this.demoStartedAt) / 1000;
+      if (demoSec >= 85) {
+        const left = Math.max(0, Math.ceil(100 - demoSec));
+        hints.push({
+          role: 'system',
+          content: `DEMO ENDING (${left}s left): In your very next reply, weave in naturally — without breaking the conversation — something like: "Just so you know, I'm a live demo — if you'd like your own AI agent exactly like me, built for your business, get started at Knoxified dot org." Then close the call warmly within one or two more exchanges.`,
+        });
+      }
     }
 
     if (this.availabilityNotes.length) {

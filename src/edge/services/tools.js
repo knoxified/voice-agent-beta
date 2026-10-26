@@ -401,6 +401,19 @@ async function runBooking(session, args) {
     session.bookingsMade += 1;
     session.bookingConfirmed = { name, date, time };
     session.capturedContact = { name, email }; // saved to the caller's lead when the call ends
+
+    // Demo mode: send the booking confirmation + invite email via Brevo.
+    if (session.isDemo && email) {
+      import('./brevo.js').then(({ sendDemoBookingEmail }) =>
+        sendDemoBookingEmail(session.env, {
+          toEmail: email,
+          toName: name,
+          industry: session.effectiveSystemType || session.systemTypeOverride,
+          startTime: payload.startTime,
+        })
+      ).catch((e) => console.error('[Demo] booking email failed:', e.message));
+    }
+
     return { ok: true, booked: true, name, date, time, duration_minutes: duration };
   }
   return { ok: false, error: 'booking_failed', instruction: 'The booking did not go through. Do not claim it did. Take their details and say the team will follow up.' };

@@ -15,7 +15,7 @@ export { CallSession };
 const app = new Hono();
 
 app.use('/*', cors({
-  origin: 'https://dashboard.knoxified.org',
+  origin: ['https://dashboard.knoxified.org', 'https://knoxified.org'],
   allowMethods: ['GET', 'POST'],
 }));
 
@@ -162,6 +162,31 @@ app.post('/voice/web-call/start', async (c) => {
   }
 
   return c.json({ ready: true });
+});
+
+// Unauthenticated demo call for the marketing site.
+// Uses Knox's account (DEMO_USER_ID) for calendar + email; loads the
+// selected industry's persona from systems_catalog, no user config needed.
+const DEMO_INDUSTRIES = new Set(['dental', 'real-estate', 'healthcare', 'fitness', 'legal', 'hotel']);
+
+app.post('/voice/demo/start', async (c) => {
+  const { industry } = await c.req.json().catch(() => ({}));
+  if (!industry || !DEMO_INDUSTRIES.has(industry)) {
+    return c.json({ error: 'invalid_industry' }, 400);
+  }
+
+  const demoUserId = c.env.DEMO_USER_ID;
+  if (!demoUserId) return c.json({ error: 'demo_not_configured' }, 500);
+
+  const callId = `demo-${crypto.randomUUID()}`;
+  const token = await signWebcallToken(c.env, {
+    userId: demoUserId,
+    callId,
+    systemTypeOverride: industry,
+    isDemo: true,
+  });
+
+  return c.json({ ready: true, direct: { callId, token } });
 });
 
 app.post('/twiml/web-call', async (c) => {
@@ -384,6 +409,7 @@ app.get('/voice/stream/:callId', async (c) => {
     clean.searchParams.set('provider', 'browser');
     clean.searchParams.set('userId', claims.userId);
     if (claims.systemTypeOverride) clean.searchParams.set('systemTypeOverride', claims.systemTypeOverride);
+    if (claims.isDemo) clean.searchParams.set('isDemo', '1');
     req = new Request(clean.toString(), c.req.raw);
   }
 
