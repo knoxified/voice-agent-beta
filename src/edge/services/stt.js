@@ -30,7 +30,8 @@ function buildDeepgramUrl(opts = {}) {
     punctuate: 'true',
     interim_results: 'true',
     endpointing: String(opts.endpointingMs || 300),
-    utterance_end_ms: String(opts.utteranceEndMs || 600),
+    // Deepgram rejects (HTTP 400) anything below 1000 ms for utterance_end_ms.
+    utterance_end_ms: String(Math.max(1000, Number(opts.utteranceEndMs) || 1000)),
     vad_events: 'true',
   });
   if (encoding === 'linear16') params.set('channels', '1');

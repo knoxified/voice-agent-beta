@@ -431,7 +431,7 @@ export class CallSession {
         },
         (err) => console.error('[STT] Connection error:', err.message || err),
         (text) => this.markCallerActivity(text),
-        { ...this.sttFormat, keyterms: this.buildKeyterms(), utteranceEndMs: Number(this.env.STT_UTTERANCE_END_MS || 600) }
+        { ...this.sttFormat, keyterms: this.buildKeyterms(), utteranceEndMs: Math.max(1000, Number(this.env.STT_UTTERANCE_END_MS || 1000)) }
       );
       console.log('[Stream] Deepgram WebSocket connected');
     } catch (err) {
