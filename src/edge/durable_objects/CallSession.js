@@ -1195,6 +1195,9 @@ export class CallSession {
   async endCall() {
     this.ending = true;
     this.cleanup();
+    // The stop event and the socket close both land here; only bill/save once.
+    if (this.endCallDone) return;
+    this.endCallDone = true;
 
     if (!this.callId || !this.callStartedAt) return;
 

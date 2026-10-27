@@ -59,22 +59,50 @@ async function callCloudflareFallback(env, messages, tools, maxTokens) {
   }
 
   const out = await env.AI.run('@cf/openai/gpt-oss-20b', payload);
-  const cfContent = out?.response?.trim() || null;
 
-  // Cloudflare returns tool_calls with arguments as an object (not a JSON
-  // string), so normalise to the OpenAI shape the rest of the code expects.
+  // Workers AI returns different shapes depending on the model/version:
+  //   legacy:        { response, tool_calls: [{ name, arguments }] }
+  //   chat format:   { choices: [{ message: { content, tool_calls } }] }
+  //   responses API: { output: [{ type: 'message', content: [{ type: 'output_text', text }] },
+  //                             { type: 'function_call', name, arguments }] }
+  // Read all of them, otherwise a perfectly good answer shows up as "null".
+  const msg = out?.choices?.[0]?.message;
+  const outputItems = Array.isArray(out?.output) ? out.output : [];
+  const outputText = outputItems
+    .filter((o) => o?.type === 'message')
+    .flatMap((o) => (Array.isArray(o.content) ? o.content : []))
+    .filter((c) => c?.type === 'output_text' && c.text)
+    .map((c) => c.text)
+    .join(' ');
+  const cfContent = String(
+    (typeof out?.response === 'string' ? out.response : '') || msg?.content || outputText || ''
+  ).trim() || null;
+
+  const rawCalls = [
+    ...(Array.isArray(out?.tool_calls) ? out.tool_calls : []),
+    ...(Array.isArray(msg?.tool_calls) ? msg.tool_calls : []),
+    ...outputItems.filter((o) => o?.type === 'function_call'),
+  ];
+
+  // Normalise to the OpenAI shape the rest of the code expects (arguments as a JSON string).
   let cfToolCalls = null;
-  if (Array.isArray(out?.tool_calls) && out.tool_calls.length) {
-    cfToolCalls = out.tool_calls.map((tc, i) => ({
-      id: `cf_${i}`,
-      type: 'function',
-      function: {
-        name: tc.name,
-        arguments: typeof tc.arguments === 'string'
-          ? tc.arguments
-          : JSON.stringify(tc.arguments ?? {}),
-      },
-    }));
+  if (rawCalls.length) {
+    cfToolCalls = rawCalls.map((tc, i) => {
+      const fn = tc.function || tc;
+      const args = fn.arguments;
+      return {
+        id: tc.id || tc.call_id || `cf_${i}`,
+        type: 'function',
+        function: {
+          name: fn.name,
+          arguments: typeof args === 'string' ? args : JSON.stringify(args ?? {}),
+        },
+      };
+    });
+  }
+
+  if (!cfContent && !cfToolCalls) {
+    console.error('[CF] Empty fallback reply, response keys:', Object.keys(out || {}).join(','));
   }
 
   return {

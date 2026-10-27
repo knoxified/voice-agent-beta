@@ -23,6 +23,10 @@ Stages:
 Be strict. Small talk or one vague mention is "discover". Choose "agreed" only if the agent proposed the step first and the caller said yes.
 Be slow to choose "not_fit": use it only for a wrong number, spam, abuse, or something clearly unrelated AFTER the caller has had a chance to explain. A symptom, problem or request that could plausibly relate to the business (for example jaw, face or chewing pain for a dental practice) is "discover" or "qualified", never "not_fit".`;
 
+// A model Groq says doesn't exist / isn't allowed for this key. Remembered for
+// the life of the isolate so we don't burn a failed request on every turn.
+const badModels = new Set();
+
 export async function classifyStage(env, messages, { businessName, criteria } = {}) {
   const convo = messages
     .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.content)
@@ -34,7 +38,9 @@ export async function classifyStage(env, messages, { businessName, criteria } = 
   const groq = new Groq({ apiKey: env.GROQ_API_KEY, maxRetries: 0, timeout: 3000 });
   // Same brain as the conversation by default: it is the one model we know is
   // live on this account. Override with GROQ_CLASSIFIER_MODEL if you add a faster one.
-  const model = env.GROQ_CLASSIFIER_MODEL || env.GROQ_MODEL || 'openai/gpt-oss-20b';
+  const mainModel = env.GROQ_MODEL || 'openai/gpt-oss-20b';
+  const wanted = env.GROQ_CLASSIFIER_MODEL || mainModel;
+  const model = badModels.has(wanted) ? mainModel : wanted;
   const reasoning = /gpt-oss|qwen3|deepseek-r1/i.test(model);
 
   const params = {
@@ -61,6 +67,10 @@ export async function classifyStage(env, messages, { businessName, criteria } = 
     return { stage: parsed.stage, reason: String(parsed.reason || '').slice(0, 80) };
   } catch (err) {
     console.warn('[Stage] classifier failed:', err.message);
+    if (/model_not_found|does not exist|do not have access/i.test(String(err.message)) && model !== mainModel) {
+      badModels.add(model);
+      console.warn(`[Stage] ${model} unavailable, using ${mainModel} from now on`);
+    }
     return null;
   }
 }
