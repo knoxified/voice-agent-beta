@@ -222,11 +222,23 @@ async function runTakeQuestion(session, args) {
     return { ok: true, noted: true, instruction: 'Already noted several questions. Say the team will follow up on those, and move on.' };
   }
   session.questionsLogged = (session.questionsLogged || 0) + 1;
+  session.questionTurn = session.callerTurns || 0;
   await logPendingQuestion(session.env, session.userId, question, session.callId, session.callerNumber);
+
+  // Can the team actually reach this caller? Phone calls have a number; web calls only if they gave one.
+  const hasCallerId = !!(session.callerNumber && String(session.callerNumber).replace(/\D/g, '').length >= 6);
+  const reachable = hasCallerId || !!(session.followUp?.email || session.followUp?.phone);
+  if (!reachable) {
+    return {
+      ok: true,
+      noted: true,
+      instruction: 'Say plainly that you do not have that information (for example "I don\'t have the exact answer on that one"). Then, in the same reply, ask for the best email or number so the team can confirm it, and tell them to take it slowly. Read it back once. When they say yes, use take_message with it and what they asked. Do not guess an answer. If they do not want to give one, drop it and keep helping.',
+    };
+  }
   return {
     ok: true,
     noted: true,
-    instruction: 'Tell the caller, briefly and naturally, that you have noted their question and the team will get back to them. Do not guess an answer. Then continue the conversation.',
+    instruction: 'Say plainly that you do not have that information, that you have noted their question and the team will get back to them. Do not guess an answer. Then keep helping with what you do know.',
   };
 }
 

@@ -93,6 +93,10 @@ export class CallSession {
     this.nameAsks = 0;        // times the agent actually asked
     this.nameAskedTurn = 0;   // callerTurns value when it last asked
     this.nameHintCache = null;
+    // Stage safety net: consecutive classifier failures, and when a question was logged without a way to reach the caller.
+    this.stageFailures = 0;
+    this.stageUnknown = false;
+    this.questionTurn = 0;
 
     // Silence handling: ask "still there?" after SILENCE_PROMPT, hang up
     // SILENCE_HANGUP after that if the caller still hasn't spoken.
@@ -713,7 +717,15 @@ export class CallSession {
     const cfg = this.agentConfig || {};
     return classifyStage(this.env, this.messages, { businessName: cfg.organization_name, criteria: this.qualificationCriteria })
       .then((r) => {
-        if (!r) return;
+        if (!r) {
+          // Every classifier model failed: keep the last known stage, and after two
+          // misses stop pretending we are still in 'discover' (see buildDynamicHints).
+          this.stageFailures += 1;
+          if (this.stageFailures >= 2) this.stageUnknown = true;
+          return;
+        }
+        this.stageFailures = 0;
+        this.stageUnknown = false;
         let stage = r.stage;
         // Once the caller agreed, later short answers (names, emails) must not re-lock the tools.
         if (this.actionUnlocked && (stage === 'discover' || stage === 'qualified')) stage = 'agreed';
@@ -859,8 +871,10 @@ export class CallSession {
 
     const cta = (this.agentConfig?.main_call_to_action || 'a visit or appointment').trim();
     if (!this.bookingConfirmed) {
-      if (this.stage === 'discover') {
-        hints.push('Stage: still discovering. Do NOT suggest a visit, appointment, call-back or any next step yet. React to what they said and ask one specific follow-up about their situation (what exactly, how long, how bad, what they have already tried).');
+      if (this.stageUnknown && this.stage === 'discover') {
+        hints.push('Just help the caller directly. Answer what they asked from your notes. If you do not have the answer, say so plainly instead of asking them questions. Ask a follow-up only when you genuinely need the detail to help, and make a soft next-step suggestion once the caller has a clear, real need.');
+      } else if (this.stage === 'discover') {
+        hints.push('Stage: still discovering. Do NOT suggest a visit, appointment, call-back or any next step yet. If they asked you a direct question, answer it first (or say plainly you do not have the answer). Then react to what they said and ask one specific follow-up about their situation (what exactly, how long, how bad, what they have already tried).');
       } else if (this.stage === 'qualified') {
         hints.push(`Stage: the caller is a genuine fit. If you have not already, make ONE soft next-step suggestion now in your own words, the way a person in your role naturally would (what the business wants from a good call: ${cta}). Do not mention booking systems, calendars or tools, and do not ask for personal details yet. If they answer vaguely, keep helping instead of pushing.`);
       } else if (this.stage === 'agreed') {
@@ -870,6 +884,12 @@ export class CallSession {
       } else if (this.stage === 'not_fit') {
         hints.push('Stage: you may have misjudged this call. Do not wrap up or end it. Ask one gentle question to understand what they need. If it truly is something the business cannot do, say so kindly, point them to the right kind of help, offer to take a message, and stay on the line until they are done.');
       }
+    }
+
+    // A question went to the team but there is no way to reach the caller (web call, no caller ID, no contact given yet).
+    const reachable = !!(this.followUp?.email || this.followUp?.phone || (this.callerNumber && String(this.callerNumber).replace(/\D/g, '').length >= 6));
+    if (this.questionsLogged > 0 && !reachable && !this.bookingConfirmed && this.callerTurns - this.questionTurn <= 3) {
+      hints.push('You said the team will confirm something but you have no way to reach this caller. If you have not already, ask for the best email or phone number now, in one short natural sentence. Read it back once, and when they say yes use take_message with it (include what they asked). If they do not want to give one, drop it and keep helping; never ask more than twice.');
     }
 
     if (this.knownCaller?.name && !this.bookingConfirmed) {
@@ -1149,7 +1169,7 @@ export class CallSession {
       }
     }
 
-    lines.push('', 'If the caller asks a factual question about the business that is not covered in your notes above, do NOT guess or invent an answer. Use the take_question tool so the owner can follow up, and tell the caller the team will get back to them.');
+    lines.push('', 'If the caller asks a factual question about the business that is not covered in your notes above (price, stock, availability, policy), do NOT guess or invent an answer. Say plainly and naturally that you do not have that information, for example "I don\'t have the exact price on that one, I\'ll get the team to confirm it". Use the take_question tool so the owner can follow up, then keep helping with what you do know. If the caller wants to buy, book or act on it, treat it as a priority: collect their best email or number right away in the same reply. Never make the caller repeat or re-explain something you could not answer yourself.');
 
     // Industry-specific tone/vocabulary from whichever Systems (verticals)
     // the client has activated -- e.g. plumbing calls talk about triage and
