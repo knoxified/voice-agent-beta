@@ -55,16 +55,31 @@ function buildDeepgramUrl(opts = {}) {
  * @returns {Promise<WebSocket>} the open Deepgram WebSocket
  */
 async function createLiveTranscription(env, onTranscript, onError, onActivity, opts = {}) {
-  const res = await fetch(buildDeepgramUrl(opts), {
-    headers: {
-      Upgrade: 'websocket',
-      Authorization: `Token ${env.DEEPGRAM_API_KEY}`,
-    },
-  });
+  if (!env.DEEPGRAM_API_KEY) {
+    throw new Error('DEEPGRAM_API_KEY is not set on this worker');
+  }
+  const connect = (o) =>
+    fetch(buildDeepgramUrl(o), {
+      headers: {
+        Upgrade: 'websocket',
+        Authorization: `Token ${env.DEEPGRAM_API_KEY}`,
+      },
+    });
+
+  let res = await connect(opts);
+  // A 400 is usually a rejected parameter (e.g. a keyterm). Retry once without
+  // keyterms so the caller is still heard.
+  if (!res.webSocket && res.status === 400 && opts.keyterms?.length) {
+    console.error('[STT] Deepgram rejected request (400), retrying without keyterms:', (await res.text()).slice(0, 300));
+    res = await connect({ ...opts, keyterms: [] });
+  }
 
   const ws = res.webSocket;
   if (!ws) {
-    throw new Error('Deepgram did not return a WebSocket upgrade');
+    // Surface Deepgram's actual reason (401 bad key, 402 no credit, 400 bad param...)
+    let detail = '';
+    try { detail = (await res.text()).slice(0, 300); } catch {}
+    throw new Error(`Deepgram did not return a WebSocket upgrade (HTTP ${res.status}) ${detail}`);
   }
   ws.accept();
 
