@@ -87,6 +87,12 @@ export class CallSession {
     this.followUp = null; // set by take_message: { message, phone, email, name }
     this.effectiveSystemType = null;
     this.callerTurns = 0;
+    // Caller-name capture: ask early and naturally (see nameHint()).
+    this.callerName = null;
+    this.nameDeclined = false;
+    this.nameAsks = 0;        // times the agent actually asked
+    this.nameAskedTurn = 0;   // callerTurns value when it last asked
+    this.nameHintCache = null;
 
     // Silence handling: ask "still there?" after SILENCE_PROMPT, hang up
     // SILENCE_HANGUP after that if the caller still hasn't spoken.
@@ -482,6 +488,7 @@ export class CallSession {
     try {
       this.messages.push({ role: 'user', content: transcript });
       this.callerTurns += 1;
+      this.noteCallerName(transcript);
 
       // Judge the conversation stage in parallel with the reply (no added latency).
       const stagePromise = this.updateStage();
@@ -694,7 +701,9 @@ export class CallSession {
       return L.join('\n');
     }
     L.push(`2) LOCKED IN: ${this.selectedSlot.label} on ${dl}. This time is open and final. Do not offer, mention or discuss any other time, and never check the calendar again unless THEY ask for a different day.`);
-    L.push('3) Name: ask for their full name. When they say it, repeat it back ONCE in a natural way ("Sarah Okafor, is that right?"). Spell it letter by letter only if they correct you or it is an unusual name you are unsure of.');
+    if (this.callerName) {
+      L.push(`3) Name: they already told you their name (${this.callerName}). Do not ask for it again. If you only have a first name, ask once for their last name ("and your last name?"); otherwise just confirm you will book it under ${this.callerName}.`);
+    } else L.push('3) Name: ask for their full name. When they say it, repeat it back ONCE in a natural way ("Sarah Okafor, is that right?"). Spell it letter by letter only if they correct you or it is an unusual name you are unsure of.');
     L.push('4) Email: ask for their best email and tell them to take it slowly. Read it back in short pieces with a natural pause: the part before the at sign first, then "at", then the domain. Say common domains as one word ("gmail dot com", "yahoo dot com", "outlook dot com"), never spelled out. Spell letter by letter only the part before the at sign, and only if it is not a plain word. Then ask "did I get that right?" If something is wrong, fix just that piece and read only that piece back again. Do not move on until they say yes. Never ask for a phone number; accept it only if they offer.');
     L.push('5) Only after they confirm both the name and the email, use book_appointment with a one-sentence reason for the visit taken from what they told you, and details_confirmed true. Say "one moment" naturally first. Never say it is booked until the tool confirms.');
     return L.join('\n');
@@ -718,6 +727,10 @@ export class CallSession {
 
   pushAssistant(text) {
     this.messages.push({ role: 'assistant', content: text });
+    if (!this.callerName && /\b(your name|who am i (speaking|talking) (with|to)|who do i have|who(?:'s| is) (this|calling)|what should i call you|who(?:'s| is) on the line|may i ask who)\b/i.test(String(text))) {
+      this.nameAsks += 1;
+      this.nameAskedTurn = this.callerTurns;
+    }
     if (this.messages.length > 22) {
       const sys = this.messages[0];
       this.messages = [sys, ...this.messages.slice(-20)];
@@ -779,6 +792,61 @@ export class CallSession {
     );
   }
 
+  // Picks up the caller's name from what they said, so we never ask twice.
+  // Deliberately conservative: the model still sees the whole conversation
+  // and is told not to ask if the name was already given.
+  noteCallerName(transcript) {
+    if (this.callerName) return;
+    const text = String(transcript || '').trim();
+    const NOT_NAMES = /^(calling|looking|trying|interested|just|here|not|sorry|good|fine|great|well|wondering|hoping|having|in|a|an|the|from|at|with|new|sure|yes|yeah|okay|ok|hi|hello|hey|thanks|thank|um|uh|so|really|actually|also|about|going|getting|needing|wanting|worried|calling|ready|back|late|on|for|to|and|but|it|that|this|how|what|when|where|why|who|please|real|dental|glad|happy|afraid|concerned|curious|thinking)$/i;
+    const cap = (w) => /^[A-Z][a-z'’-]{1,18}$/.test(w) && !NOT_NAMES.test(w);
+
+    // 1) Explicit introduction: "my name is Sarah Okafor", "this is Sarah", "I'm Sarah".
+    const m = text.match(/\b(?:my name(?:'s|’s| is)|name(?:'s|’s)|this is|call me|it(?:'s|’s) |i(?:'m|’m| am))\s*([A-Za-z'’-]+)(?:\s+([A-Za-z'’-]+))?/i);
+    if (m && cap(m[1])) {
+      this.callerName = cap(m[2] || '') ? `${m[1]} ${m[2]}` : m[1];
+      console.log('[Name] Caller introduced themselves');
+      return;
+    }
+
+    // 2) A short answer right after the agent asked: "Sarah", "It's Sarah Okafor", "Sarah O.".
+    if (this.nameAsks > 0 && this.callerTurns === this.nameAskedTurn + 1) {
+      if (/\b(rather not|no thanks|none of your|why do you need|not telling|prefer not)\b/i.test(text)) {
+        this.nameDeclined = true;
+        console.log('[Name] Caller declined to give a name');
+        return;
+      }
+      const bare = text.replace(/^(yeah|yes|sure|okay|ok|hi|hey|hello|um+|uh+|so|well)[,.\s]+/i, '').replace(/[.!?,]+$/g, '').trim();
+      const words = bare.split(/\s+/);
+      if (words.length >= 1 && words.length <= 3 && words.every((w, i) => cap(w) || (i > 0 && /^[A-Z]\.?$/.test(w)))) {
+        this.callerName = bare;
+        console.log('[Name] Caller gave their name');
+      }
+    }
+  }
+
+  // Asks for the caller's name the way a person on the phone would: after
+  // reacting to why they called, not as a gate in front of it. Returns null
+  // when nothing should be asked this turn. Cached per turn so retries of the
+  // same turn see the same hint.
+  nameHint() {
+    const t = this.callerTurns;
+    if (this.nameHintCache?.turn === t) return this.nameHintCache.text;
+    let text = null;
+    const skip = this.callerName || this.nameDeclined || this.knownCaller?.name
+      || this.bookingConfirmed || this.stage === 'agreed' || this.nameAsks >= 2;
+    if (!skip && t >= 1) {
+      const rules = 'Ask it as one short, casual question in your own words, never a form-style demand, and never "may I have your full name". If they already told you their name anywhere in this conversation, do not ask. If they sound distressed, in pain, in an emergency, angry or in a hurry, skip it now and help first; ask later once things are calmer. If they hesitate or decline, drop it and never ask again. Do not make it sound like a requirement.';
+      if (this.nameAsks === 0 && t <= 3) {
+        text = `Name: you do not know the caller's name yet and a real person would have it by now. In THIS reply, first react to or answer what they just said in a way that fits it, then ask who you are speaking with, in the same breath, for example "Happy to help with that, who am I speaking with?" or "Oh, I can sort that out. Can I get your name first?" If they only said hello and gave no reason yet, simply ask "Hi, who am I speaking with?" and then let them tell you why they called. ${rules}`;
+      } else if (this.nameAsks === 1 && t >= this.nameAskedTurn + 2 && t <= 8) {
+        text = `Name: you asked for their name earlier and still do not have it (they may have skipped it). Only if it fits the moment, ask once more, lightly, tucked into your reply, for example "By the way, who am I talking to?". If the moment does not fit, do not ask this turn. ${rules}`;
+      }
+    }
+    this.nameHintCache = { turn: t, text };
+    return text;
+  }
+
   // Context the model needs this turn but that doesn't belong in the saved
   // transcript: how long the call has run, and facts learned from tools.
   buildDynamicHints() {
@@ -834,6 +902,10 @@ export class CallSession {
       const lines = this.availabilityNotes.map((n) => `${n.date}: ${n.summary}`).join(' | ');
       hints.push(`Availability already looked up on this call (use it, do not re-check unless the caller changes the day): ${lines}`);
     }
+
+    const nameHint = this.nameHint();
+    if (nameHint) hints.push(nameHint);
+    else if (this.callerName && !this.bookingConfirmed) hints.push(`The caller's name is ${this.callerName}. Use it rarely and naturally (see the earlier rule), never ask for it again.`);
 
     return hints.map((content) => ({ role: 'system', content }));
   }
