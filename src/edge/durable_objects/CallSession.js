@@ -179,6 +179,9 @@ export class CallSession {
       // id is the (verified) last path segment, never taken from the client.
       this.callId = url.pathname.split('/').pop();
       this.systemTypeOverride = url.searchParams.get('systemTypeOverride') || null;
+      // index.js strips client-supplied params and re-adds isDemo only when the
+      // signed token says so, so this value is server-verified.
+      this.isDemo = url.searchParams.get('isDemo') === '1';
     }
 
     console.log(`[Stream] Upgrade request | user: ${this.userId} | provider: ${this.provider}`);
@@ -299,13 +302,9 @@ export class CallSession {
 
     this.callStartedAt = Date.now();
 
-    // Demo flag comes from the verified token via index.js — never from raw
-    // query params the browser could forge.
-    const callUrl = new URL(c.req.url);
-    if (callUrl.searchParams.get('isDemo') === '1') {
-      this.isDemo = true;
-      this.demoStartedAt = Date.now();
-    }
+    // Demo flag was set in handleStreamUpgrade from the verified token
+    // (forwarded by index.js) — never from raw browser query params.
+    if (this.isDemo) this.demoStartedAt = Date.now();
 
     const user = await getUserById(this.env, this.userId);
     this.isTrial = this.isDemo ? false : (user?.isTrial || false);
