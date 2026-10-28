@@ -1,243 +1,267 @@
-import Groq from 'groq-sdk';
+// ── LLM router ────────────────────────────────────────────────────────────────
+// One conversation, several free quotas. Every turn walks a chain of providers
+// and uses the first one that answers. A provider that rate-limits (or errors)
+// is put on a cool-down so later turns skip it instantly instead of paying a
+// failed request first.
+//
+// Chain (override with LLM_CHAIN="gemini,groq,openrouter,cf"):
+//   gemini      Google Gemini free tier  (GEMINI_API_KEY,  GEMINI_MODELS)
+//   groq        Groq free tier           (GROQ_API_KEY,    GROQ_MODEL)
+//   openrouter  OpenRouter ":free" only  (OPENROUTER_API_KEY, OPENROUTER_MODELS)
+//   cf          Cloudflare Workers AI    (AI binding, CF_MAIN_MODEL)
+//
+// All but `cf` speak the OpenAI chat-completions format, so one client covers them.
 
-// ── Rate-limit helpers ────────────────────────────────────────────────────────
+const PROVIDER_URLS = {
+  gemini: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
+  groq: 'https://api.groq.com/openai/v1/chat/completions',
+  openrouter: 'https://openrouter.ai/api/v1/chat/completions',
+};
 
-// Groq 429 messages say "Please try again in 5.3s." — pull that number out.
-function parseRetryAfterMs(err) {
-  const msg = String(err?.message || err?.error?.message || '');
-  const m = msg.match(/try again in ([\d.]+)s/i);
-  return m ? Math.ceil(parseFloat(m[1]) * 1000) : null;
+const FIRST_TOKEN_MS = 5000;   // give up on a provider that has not started answering
+const OVERALL_MS = 20000;
+
+
+// ── Cool-downs (per isolate) ──────────────────────────────────────────────────
+const coolUntil = new Map(); // "provider:model" -> epoch ms
+
+function nextUtcMidnight() {
+  const d = new Date();
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 0, 5);
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function isCooling(key) {
+  const t = coolUntil.get(key);
+  if (!t) return false;
+  if (Date.now() >= t) { coolUntil.delete(key); return false; }
+  return true;
+}
 
-// ── Cloudflare Workers AI fallback (same model, separate quota) ───────────────
-// Used when Groq returns 429 and the wait is too long (or a second 429 fires).
-// env.AI binding is wired in wrangler.jsonc under "ai": { "binding": "AI" }.
+class LlmError extends Error {
+  constructor(message, { status = 0, retryAfterMs = null } = {}) {
+    super(message);
+    this.status = status;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
 
-/**
- * Cloudflare Workers AI binding requires message content to be a plain string.
- * The Groq conversation history can have:
- *   - content as an array (multi-part messages)
- *   - content as null (assistant messages that only made tool calls)
- *   - role 'tool' (tool results — CF binding doesn't support this role)
- * Strip or flatten all of these before sending.
- */
-function sanitizeForCF(messages) {
-  return messages.reduce((acc, msg) => {
-    const role = msg.role;
-    if (!['system', 'user', 'assistant'].includes(role)) return acc;
+function parseRetryAfterMs(text, headers) {
+  const h = headers?.get?.('retry-after');
+  if (h && !Number.isNaN(Number(h))) return Math.ceil(Number(h) * 1000);
+  const m = String(text || '').match(/try again in ([\d.]+)\s*(ms|s|m)?|retryDelay"?\s*:\s*"?([\d.]+)s/i);
+  if (!m) return null;
+  if (m[3]) return Math.ceil(parseFloat(m[3]) * 1000);
+  const n = parseFloat(m[1]);
+  return Math.ceil(m[2] === 'ms' ? n : m[2] === 'm' ? n * 60000 : n * 1000);
+}
 
-    let content;
-    if (Array.isArray(msg.content)) {
-      content = msg.content.filter(c => c?.type === 'text').map(c => c.text).join(' ').trim();
-    } else if (msg.content === null || msg.content === undefined) {
-      if (msg.tool_calls?.length) return acc; // tool-call-only assistant turn — skip
-      content = '';
-    } else {
-      content = String(msg.content);
+// Decide how long to skip a provider after a failure.
+function coolDown(key, err) {
+  const msg = String(err?.message || '');
+  let until;
+  if (err?.status === 429) {
+    const daily = /per[ -]?day|daily|\bTPD\b|\bRPD\b|PerDay/i.test(msg);
+    until = daily ? nextUtcMidnight() : Date.now() + Math.min(Math.max(err.retryAfterMs || 20000, 5000), 90000);
+  } else if (err?.status === 401 || err?.status === 403) {
+    until = Date.now() + 10 * 60000; // bad / blocked key: do not hammer it
+    console.error(`[LLM] ${key} rejected our key (HTTP ${err.status}). Check the secret.`);
+  } else if (err?.status === 404 || /model_not_found|no such model|does not exist|decommission|deprecated/i.test(msg)) {
+    until = Date.now() + 6 * 3600000; // model gone: stop asking
+  } else {
+    until = Date.now() + 15000; // 5xx, timeout, network
+  }
+  coolUntil.set(key, until);
+  console.warn(`[LLM] ${key} unavailable for ${Math.round((until - Date.now()) / 1000)}s (${err?.status || 'err'}: ${msg.slice(0, 140)})`);
+}
+
+// ── Chain construction ────────────────────────────────────────────────────────
+const list = (s) => String(s || '').split(',').map((x) => x.trim()).filter(Boolean);
+
+function buildChain(env) {
+  const order = list(env.LLM_CHAIN || 'gemini,groq,openrouter,cf');
+  const chain = [];
+  for (const p of order) {
+    if (p === 'gemini' && env.GEMINI_API_KEY) {
+      for (const model of list(env.GEMINI_MODELS || 'gemini-2.5-flash-lite')) chain.push({ provider: 'gemini', model });
+    } else if (p === 'groq' && env.GROQ_API_KEY) {
+      chain.push({ provider: 'groq', model: env.GROQ_MODEL || 'openai/gpt-oss-20b' });
+    } else if (p === 'openrouter' && env.OPENROUTER_API_KEY) {
+      for (const model of list(env.OPENROUTER_MODELS || 'openai/gpt-oss-20b:free,google/gemma-4-26b-a4b-it:free,openai/gpt-oss-120b:free')) {
+        // Hard guard: only ":free" ids may ever be sent, so a typo cannot spend credits.
+        if (!model.endsWith(':free')) { console.error(`[LLM] Refusing non-free OpenRouter model "${model}"`); continue; }
+        chain.push({ provider: 'openrouter', model });
+      }
+    } else if (p === 'cf' && env.AI) {
+      chain.push({ provider: 'cf', model: env.CF_MAIN_MODEL || '@cf/openai/gpt-oss-20b' });
     }
-
-    if (role === 'assistant' && !content) return acc;
-    acc.push({ role, content });
-    return acc;
-  }, []);
+  }
+  return chain;
 }
 
-async function callCloudflareFallback(env, messages, tools, maxTokens) {
-  if (!env?.AI) throw new Error('[CF] AI binding not available');
+const isReasoning = (model) => /gpt-oss|qwen3|deepseek-r1|gemma-4/i.test(model) && !/gemini/i.test(model);
 
-  const payload = {
-    messages: sanitizeForCF(messages),
-    max_tokens: maxTokens || 300,
-    stream: false,
+function maxTokensFor(entry, hasTools, override) {
+  if (override) return override;
+  if (isReasoning(entry.model)) return hasTools ? 700 : 450; // reasoning eats the budget before any answer
+  return hasTools ? 350 : 250;
+}
+
+function buildBody(env, entry, messages, temperature, tools, stream, override) {
+  const body = {
+    model: entry.model,
+    messages,
+    temperature,
+    max_tokens: maxTokensFor(entry, !!tools?.length, override),
+    stream,
   };
-  if (tools?.length) {
-    payload.tools = tools;
-    payload.tool_choice = 'auto';
-    payload.parallel_tool_calls = false;
+  if (tools?.length) { body.tools = tools; body.tool_choice = 'auto'; }
+  if (entry.provider === 'groq') {
+    if (tools?.length) body.parallel_tool_calls = false;
+    if (isReasoning(entry.model)) body.reasoning_effort = 'low';
+    if (stream) body.stream_options = { include_usage: true };
+  } else if (entry.provider === 'openrouter') {
+    if (isReasoning(entry.model)) body.reasoning = { effort: 'low' };
+    if (stream) body.stream_options = { include_usage: true };
+    body.provider = {
+      require_parameters: !!tools?.length,              // only endpoints that really support tools
+      data_collection: env.OPENROUTER_ALLOW_DATA_COLLECTION === '1' ? 'allow' : 'deny', // callers' details must not be retained/trained on
+    };
+  }
+  return body;
+}
+
+function headersFor(env, entry) {
+  const key = entry.provider === 'gemini' ? env.GEMINI_API_KEY : entry.provider === 'groq' ? env.GROQ_API_KEY : env.OPENROUTER_API_KEY;
+  const h = { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` };
+  if (entry.provider === 'openrouter') { h['HTTP-Referer'] = 'https://knoxified.org'; h['X-Title'] = 'Knoxified Voice Agent'; }
+  return h;
+}
+
+async function post(env, entry, body, signal) {
+  const res = await fetch(PROVIDER_URLS[entry.provider], {
+    method: 'POST', headers: headersFor(env, entry), body: JSON.stringify(body), signal,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new LlmError(`${entry.provider} ${res.status}: ${text.slice(0, 300)}`, { status: res.status, retryAfterMs: parseRetryAfterMs(text, res.headers) });
+  }
+  return res;
+}
+
+function normaliseCalls(calls) {
+  const out = (calls || []).filter(Boolean).filter((c) => c.function?.name).map((c, i) => ({
+    id: c.id || `call_${Date.now()}_${i}`,
+    type: 'function',
+    function: { name: c.function.name, arguments: typeof c.function.arguments === 'string' ? (c.function.arguments || '{}') : JSON.stringify(c.function.arguments ?? {}) },
+  }));
+  return out.length ? out : null;
+}
+
+// ── One-shot call to an OpenAI-compatible provider ───────────────────────────
+async function callCompat(env, entry, messages, temperature, tools, override) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), OVERALL_MS);
+  try {
+    const res = await post(env, entry, buildBody(env, entry, messages, temperature, tools, false, override), ctl.signal);
+    const data = await res.json();
+    const choice = data.choices?.[0] || {};
+    const msg = choice.message || {};
+    if (data.usage) console.log(`[LLM] ${entry.provider}/${entry.model} tokens: prompt ${data.usage.prompt_tokens} + out ${data.usage.completion_tokens}`);
+    return { content: (msg.content || '').trim() || null, toolCalls: normaliseCalls(msg.tool_calls), finish: choice.finish_reason };
+  } catch (err) {
+    if (err.name === 'AbortError') throw new LlmError(`${entry.provider} timeout`, { status: 0 });
+    throw err;
+  } finally { clearTimeout(timer); }
+}
+
+// ── Cloudflare Workers AI (last resort) ───────────────────────────────────────
+// The binding is happier with plain text, so tool traffic is flattened into
+// notes the model can still read (dropping tool results made it hallucinate).
+function flattenForCF(messages) {
+  const names = {};
+  const out = [];
+  for (const m of messages) {
+    if (m.role === 'assistant' && m.tool_calls?.length) {
+      for (const tc of m.tool_calls) names[tc.id] = tc.function?.name;
+      if (m.content) out.push({ role: 'assistant', content: String(m.content) });
+      continue;
+    }
+    if (m.role === 'tool') {
+      out.push({ role: 'system', content: `Result of ${names[m.tool_call_id] || 'tool'}: ${String(m.content).slice(0, 1500)}` });
+      continue;
+    }
+    if (!['system', 'user', 'assistant'].includes(m.role)) continue;
+    const content = Array.isArray(m.content) ? m.content.filter((c) => c?.type === 'text').map((c) => c.text).join(' ') : String(m.content ?? '');
+    if (m.role === 'assistant' && !content.trim()) continue;
+    out.push({ role: m.role, content });
+  }
+  return out;
+}
+
+async function callCloudflare(env, entry, messages, temperature, tools, override) {
+  const payload = { messages: flattenForCF(messages), max_tokens: Math.max(override || 0, tools?.length ? 900 : 600), temperature, stream: false };
+  if (tools?.length) payload.tools = tools;
+  let out;
+  try {
+    out = await env.AI.run(entry.model, { ...payload, reasoning_effort: 'low' });
+  } catch (err) {
+    if (/reasoning|unknown|unexpected|additional/i.test(String(err?.message))) out = await env.AI.run(entry.model, payload); // param not accepted
+    else throw err;
   }
 
-  const out = await env.AI.run('@cf/openai/gpt-oss-20b', payload);
-
-  // Workers AI returns different shapes depending on the model/version:
-  //   legacy:        { response, tool_calls: [{ name, arguments }] }
-  //   chat format:   { choices: [{ message: { content, tool_calls } }] }
-  //   responses API: { output: [{ type: 'message', content: [{ type: 'output_text', text }] },
-  //                             { type: 'function_call', name, arguments }] }
-  // Read all of them, otherwise a perfectly good answer shows up as "null".
+  // Workers AI answers in a few shapes depending on model/version.
   const msg = out?.choices?.[0]?.message;
-  const outputItems = Array.isArray(out?.output) ? out.output : [];
-  const outputText = outputItems
-    .filter((o) => o?.type === 'message')
-    .flatMap((o) => (Array.isArray(o.content) ? o.content : []))
-    .filter((c) => c?.type === 'output_text' && c.text)
-    .map((c) => c.text)
-    .join(' ');
-  const cfContent = String(
-    (typeof out?.response === 'string' ? out.response : '') || msg?.content || outputText || ''
-  ).trim() || null;
-
-  const rawCalls = [
-    ...(Array.isArray(out?.tool_calls) ? out.tool_calls : []),
-    ...(Array.isArray(msg?.tool_calls) ? msg.tool_calls : []),
-    ...outputItems.filter((o) => o?.type === 'function_call'),
-  ];
-
-  // Normalise to the OpenAI shape the rest of the code expects (arguments as a JSON string).
-  let cfToolCalls = null;
-  if (rawCalls.length) {
-    cfToolCalls = rawCalls.map((tc, i) => {
-      const fn = tc.function || tc;
-      const args = fn.arguments;
-      return {
-        id: tc.id || tc.call_id || `cf_${i}`,
-        type: 'function',
-        function: {
-          name: fn.name,
-          arguments: typeof args === 'string' ? args : JSON.stringify(args ?? {}),
-        },
-      };
-    });
-  }
-
-  if (!cfContent && !cfToolCalls) {
-    console.error('[CF] Empty fallback reply, response keys:', Object.keys(out || {}).join(','));
-  }
-
-  return {
-    content: cfContent,
-    toolCalls: cfToolCalls,
-    assistantMessage: cfToolCalls
-      ? { role: 'assistant', content: cfContent, tool_calls: cfToolCalls }
-      : null,
-  };
+  const items = Array.isArray(out?.output) ? out.output : [];
+  const itemText = items.filter((o) => o?.type === 'message').flatMap((o) => (Array.isArray(o.content) ? o.content : []))
+    .filter((c) => c?.type === 'output_text' && c.text).map((c) => c.text).join(' ');
+  const content = String((typeof out?.response === 'string' ? out.response : '') || msg?.content || itemText || '').trim() || null;
+  const raw = [...(Array.isArray(out?.tool_calls) ? out.tool_calls : []), ...(Array.isArray(msg?.tool_calls) ? msg.tool_calls : []), ...items.filter((o) => o?.type === 'function_call')];
+  const toolCalls = normaliseCalls(raw.map((tc) => ({ id: tc.id || tc.call_id, function: tc.function || { name: tc.name, arguments: tc.arguments } })));
+  if (!content && !toolCalls) console.error(`[LLM] cf empty reply (finish: ${out?.choices?.[0]?.finish_reason || '?'}, keys: ${Object.keys(out || {}).join(',')})`);
+  return { content, toolCalls, finish: out?.choices?.[0]?.finish_reason };
 }
 
-// openai/gpt-oss-* are reasoning models: they spend part of the token budget
-// on an internal reasoning step before writing the final answer into
-// `content`. With a small budget that reasoning step alone can consume the
-// whole thing, leaving `content` empty. Reasoning models need more headroom,
-// and since this is a low-latency voice agent, reasoning_effort is kept low.
-function isReasoningModel(model) {
-  return model.startsWith('openai/gpt-oss');
+// ── Public: non-streaming ─────────────────────────────────────────────────────
+async function runChainOnce(env, messages, temperature, tools, override) {
+  const chain = buildChain(env);
+  if (!chain.length) throw new Error('No LLM provider configured');
+  const failures = [];
+  for (const entry of chain) {
+    const key = `${entry.provider}:${entry.model}`;
+    if (isCooling(key)) continue;
+    try {
+      const r = entry.provider === 'cf'
+        ? await callCloudflare(env, entry, messages, temperature, tools, override)
+        : await callCompat(env, entry, messages, temperature, tools, override);
+      if (!r.content && !r.toolCalls) { failures.push(`${key}: empty`); continue; }
+      console.log(`[LLM] answered by ${key}`);
+      return r;
+    } catch (err) {
+      coolDown(key, err);
+      failures.push(`${key}: ${String(err.message).slice(0, 80)}`);
+    }
+  }
+  throw new Error(`All LLM providers failed (${failures.join(' | ') || 'all cooling down'})`);
 }
 
 async function generateResponse(env, messages, temperature = 0.7) {
-  const groq = new Groq({ apiKey: env.GROQ_API_KEY });
-  const MODEL = env.GROQ_MODEL || 'openai/gpt-oss-20b';
-  const reasoningModel = isReasoningModel(MODEL);
-
-  try {
-    const params = {
-      model: MODEL,
-      messages,
-      max_tokens: reasoningModel ? 300 : 80,
-      temperature,
-      stream: false,
-    };
-    if (reasoningModel) {
-      params.reasoning_effort = 'low';
-    }
-
-    const completion = await groq.chat.completions.create(params);
-
-    const response = completion.choices[0]?.message?.content?.trim();
-    console.log(`[LLM] Tokens used: ${completion.usage?.total_tokens}`);
-
-    if (!response) {
-      console.error(`[LLM] Empty content from ${MODEL} — finish_reason: ${completion.choices[0]?.finish_reason}`);
-    }
-
-    return response || null;
-  } catch (err) {
-    console.error('[LLM] Groq error:', err.message);
-    throw err;
-  }
+  const r = await runChainOnce(env, messages, temperature, null, 400);
+  return r.content;
 }
 
-
-// Same as generateResponse, but can return tool calls. Returns
-// { content, toolCalls, assistantMessage }. If the model emits a malformed
-// tool call (Groq rejects it with tool_use_failed), retry once without tools
-// so the caller still gets a spoken answer instead of silence.
 async function generateWithTools(env, messages, temperature = 0.7, tools = null) {
-  const groq = new Groq({ apiKey: env.GROQ_API_KEY, maxRetries: 1, timeout: 8000 });
-  const MODEL = env.GROQ_MODEL || 'openai/gpt-oss-20b';
-  const reasoningModel = isReasoningModel(MODEL);
-
-  const build = (withTools) => {
-    const params = {
-      model: MODEL,
-      messages,
-      max_tokens: reasoningModel ? (withTools ? 500 : 300) : (withTools ? 200 : 80),
-      temperature,
-      stream: false,
-    };
-    if (reasoningModel) params.reasoning_effort = 'low';
-    if (withTools && tools && tools.length) {
-      params.tools = tools;
-      params.tool_choice = 'auto';
-      params.parallel_tool_calls = false;
-    }
-    return params;
-  };
-
-  let completion;
-  try {
-    completion = await groq.chat.completions.create(build(true));
-  } catch (err) {
-    const msg = String(err.message || '');
-    if (tools && (msg.includes('tool_use_failed') || msg.includes('Failed to call a function'))) {
-      console.warn('[LLM] tool_use_failed, retrying without tools');
-      completion = await groq.chat.completions.create(build(false));
-    } else if (err?.status === 429) {
-      // Rate-limit: wait the exact retry-after window if short, then try once
-      // more on Groq; otherwise go straight to the Cloudflare fallback.
-      const waitMs = parseRetryAfterMs(err);
-      if (waitMs && waitMs <= 2000) {
-        console.warn(`[LLM] 429 — waiting ${waitMs}ms then retrying Groq`);
-        await sleep(waitMs);
-        try {
-          completion = await groq.chat.completions.create(build(true));
-        } catch (err2) {
-          if (err2?.status === 429) {
-            console.warn('[LLM] 429 again — falling back to Cloudflare');
-            return callCloudflareFallback(env, messages, tools, build(true).max_tokens);
-          }
-          throw err2;
-        }
-      } else {
-        console.warn('[LLM] 429 long wait — falling back to Cloudflare');
-        return callCloudflareFallback(env, messages, tools, build(true).max_tokens);
-      }
-    } else {
-      console.error('[LLM] Groq error:', msg);
-      throw err;
-    }
-  }
-
-  const message = completion.choices[0]?.message || {};
-  console.log(`[LLM] Tokens used: ${completion.usage?.total_tokens}`);
-  const toolCalls = message.tool_calls && message.tool_calls.length ? message.tool_calls : null;
-  const content = message.content?.trim() || null;
-  if (!content && !toolCalls) {
-    console.error(`[LLM] Empty content from ${MODEL} — finish_reason: ${completion.choices[0]?.finish_reason}`);
-  }
+  const r = await runChainOnce(env, messages, temperature, tools, null);
   return {
-    content,
-    toolCalls,
-    assistantMessage: toolCalls ? { role: 'assistant', content: message.content ?? null, tool_calls: toolCalls } : null,
+    content: r.content,
+    toolCalls: r.toolCalls,
+    assistantMessage: r.toolCalls ? { role: 'assistant', content: r.content ?? null, tool_calls: r.toolCalls } : null,
   };
 }
 
-
-// ---- Streaming reply -------------------------------------------------------
-// Same contract as generateWithTools, but the spoken answer is handed to
-// onSentence() one complete sentence at a time AS the model writes it, so the
-// caller hears the first sentence while the rest is still being generated.
-// Tool-call turns are unchanged: if the model asks for a tool, nothing is
-// spoken from the stream (except any short lead-in text it wrote first).
+// ── Public: streaming ─────────────────────────────────────────────────────────
+// The spoken answer is handed to onSentence() one complete sentence at a time
+// AS the model writes it. A provider is only abandoned before anything has been
+// said; once audio started we stay with it.
 
 const ABBREV_END = /\b(a\.m|p\.m|dr|mr|mrs|ms|st|vs|etc|e\.g|i\.e)\.\s*$/i;
 
@@ -257,89 +281,114 @@ function takeSentences(buf) {
   return { sentences, rest: buf.slice(last) };
 }
 
-async function streamWithTools(env, messages, temperature = 0.7, tools = null, onSentence = () => {}) {
-  // A live call can't wait: give up after 7s (no hidden retry backoff) and let the caller's turn fall back.
-  const groq = new Groq({ apiKey: env.GROQ_API_KEY, maxRetries: 0, timeout: 7000 });
-  const MODEL = env.GROQ_MODEL || 'openai/gpt-oss-20b';
-  const reasoningModel = isReasoningModel(MODEL);
 
-  const params = {
-    model: MODEL,
-    messages,
-    max_tokens: reasoningModel ? (tools?.length ? 500 : 300) : (tools?.length ? 200 : 80),
-    temperature,
-    stream: true,
-  };
-  if (reasoningModel) params.reasoning_effort = 'low';
-  if (tools && tools.length) {
-    params.tools = tools;
-    params.tool_choice = 'auto';
-    params.parallel_tool_calls = false;
-  }
-
-  let stream;
+async function streamCompat(env, entry, messages, temperature, tools, onSentence) {
+  const ctl = new AbortController();
+  const overall = setTimeout(() => ctl.abort(), OVERALL_MS);
+  let first = setTimeout(() => ctl.abort(), FIRST_TOKEN_MS);
+  const started = Date.now();
   try {
-    stream = await groq.chat.completions.create(params);
-  } catch (err) {
-    if (err?.status === 429) {
-      console.warn('[LLM] stream 429 — falling back to Cloudflare (non-streaming)');
-      return callCloudflareFallback(env, messages, tools, params.max_tokens);
-    }
-    throw err;
-  }
+    const res = await post(env, entry, buildBody(env, entry, messages, temperature, tools, true, null), ctl.signal);
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    let full = '';
+    let pending = '';
+    let sawTool = false;
+    let streamedAny = false;
+    let usage = null;
+    const calls = [];
 
-  let full = '';
-  let pending = '';
-  let sawToolCall = false;
-  let streamedAny = false;
-  const calls = [];
-
-  for await (const chunk of stream) {
-    const d = chunk.choices?.[0]?.delta;
-    if (!d) continue;
-
-    if (d.tool_calls?.length) {
-      sawToolCall = true;
-      for (const tc of d.tool_calls) {
-        const i = tc.index ?? 0;
-        calls[i] = calls[i] || { id: '', type: 'function', function: { name: '', arguments: '' } };
-        if (tc.id) calls[i].id = tc.id;
-        if (tc.function?.name) calls[i].function.name += tc.function.name;
-        if (tc.function?.arguments) calls[i].function.arguments += tc.function.arguments;
-      }
-    }
-
-    if (d.content) {
-      full += d.content;
-      if (!sawToolCall) {
-        pending += d.content;
-        const { sentences, rest } = takeSentences(pending);
-        pending = rest;
-        for (const sentence of sentences) {
-          streamedAny = true;
-          await onSentence(sentence, false);
+    const handle = async (json) => {
+      if (json.error) throw new LlmError(`${entry.provider} stream error: ${JSON.stringify(json.error).slice(0, 200)}`, { status: json.error.code || 0 });
+      if (json.usage) usage = json.usage;
+      const d = json.choices?.[0]?.delta;
+      if (!d) return;
+      if (d.tool_calls?.length) {
+        sawTool = true;
+        for (const tc of d.tool_calls) {
+          const i = tc.index ?? 0;
+          calls[i] = calls[i] || { id: '', type: 'function', function: { name: '', arguments: '' } };
+          if (tc.id) calls[i].id = tc.id;
+          if (tc.function?.name) calls[i].function.name += tc.function.name;
+          if (tc.function?.arguments) calls[i].function.arguments += tc.function.arguments;
         }
       }
+      if (d.content) {
+        full += d.content;
+        if (!sawTool) {
+          pending += d.content;
+          const { sentences, rest } = takeSentences(pending);
+          pending = rest;
+          for (const s of sentences) { streamedAny = true; await onSentence(s, false); }
+        }
+      }
+    };
+
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (first) { clearTimeout(first); first = null; }
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim();
+        if (!data || data === '[DONE]') continue;
+        let json;
+        try { json = JSON.parse(data); } catch { continue; }
+        await handle(json);
+      }
+    }
+
+    const toolCalls = normaliseCalls(calls);
+    if (!toolCalls && pending.trim()) { streamedAny = true; await onSentence(pending.trim(), true); }
+    const content = full.trim() || null;
+    if (usage) console.log(`[LLM] ${entry.provider}/${entry.model} tokens: prompt ${usage.prompt_tokens} + out ${usage.completion_tokens}, first reply in ${Date.now() - started}ms total`);
+    return { content, toolCalls, streamedAny };
+  } catch (err) {
+    if (err.name === 'AbortError') throw new LlmError(`${entry.provider} timeout`, { status: 0 });
+    err.streamedAny = err.streamedAny ?? false;
+    throw err;
+  } finally { clearTimeout(overall); if (first) clearTimeout(first); }
+}
+
+async function streamWithTools(env, messages, temperature = 0.7, tools = null, onSentence = () => {}) {
+  const chain = buildChain(env);
+  if (!chain.length) throw new Error('No LLM provider configured');
+  const failures = [];
+  let spoke = false;
+  const tracked = async (s, last) => { spoke = true; return onSentence(s, last); };
+
+  for (const entry of chain) {
+    const key = `${entry.provider}:${entry.model}`;
+    if (isCooling(key)) continue;
+    try {
+      if (entry.provider === 'cf') {
+        const r = await callCloudflare(env, entry, messages, temperature, tools, null);
+        if (!r.content && !r.toolCalls) { failures.push(`${key}: empty`); continue; }
+        console.log(`[LLM] answered by ${key} (not streamed)`);
+        return { content: r.content, toolCalls: r.toolCalls, assistantMessage: r.toolCalls ? { role: 'assistant', content: r.content ?? null, tool_calls: r.toolCalls } : null, streamed: false, streamedLeadIn: false };
+      }
+      const r = await streamCompat(env, entry, messages, temperature, tools, tracked);
+      if (!r.content && !r.toolCalls) { failures.push(`${key}: empty`); continue; }
+      console.log(`[LLM] answered by ${key}`);
+      return {
+        content: r.content,
+        toolCalls: r.toolCalls,
+        assistantMessage: r.toolCalls ? { role: 'assistant', content: r.content, tool_calls: r.toolCalls } : null,
+        streamed: r.streamedAny && !r.toolCalls,
+        streamedLeadIn: r.streamedAny && !!r.toolCalls,
+      };
+    } catch (err) {
+      if (spoke) throw err; // audio already started: do not switch voices mid-sentence
+      coolDown(key, err);
+      failures.push(`${key}: ${String(err.message).slice(0, 80)}`);
     }
   }
-
-  const toolCalls = calls.filter(Boolean).length ? calls.filter(Boolean) : null;
-
-  // Whatever is left after the last sentence boundary: speak it now (final piece).
-  if (!toolCalls && pending.trim()) {
-    streamedAny = true;
-    await onSentence(pending.trim(), true);
-  }
-
-  const content = full.trim() || null;
-  if (!content && !toolCalls) console.error(`[LLM] Empty streamed content from ${MODEL}`);
-  return {
-    content,
-    toolCalls,
-    assistantMessage: toolCalls ? { role: 'assistant', content: content, tool_calls: toolCalls } : null,
-    streamed: streamedAny && !toolCalls,
-    streamedLeadIn: streamedAny && !!toolCalls,
-  };
+  throw new Error(`All LLM providers failed (${failures.join(' | ') || 'all cooling down'})`);
 }
 
 export { generateResponse, generateWithTools, streamWithTools };
