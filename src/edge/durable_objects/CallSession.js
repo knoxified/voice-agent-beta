@@ -1112,6 +1112,8 @@ export class CallSession {
     this.kbFaqs = [];
     this.kbWebsite = [];
     this.kbMemory = [];
+    // Off by default (identical to the old behaviour). PROMPT_RETRIEVAL=1 turns on keyword retrieval for long knowledge.
+    const retrieval = this.env.PROMPT_RETRIEVAL === '1';
     const orgName = cfg.organization_name || 'this business';
     const nickname = cfg.agent_nickname ? ` named ${cfg.agent_nickname}` : '';
     const position = cfg.agent_position || voiceSettings.agent_persona || 'receptionist';
@@ -1175,7 +1177,7 @@ export class CallSession {
     // fix for "the agent has no memory of the business it's answering for".
     if (cfg.memory_context) {
       const mem = String(cfg.memory_context);
-      const MEM_INLINE = Number(this.env.PROMPT_MEMORY_CHARS || 2500);
+      const MEM_INLINE = retrieval ? Number(this.env.PROMPT_MEMORY_CHARS || 2500) : Infinity;
       if (mem.length <= MEM_INLINE) {
         lines.push('', 'What you know about this business (use naturally, do not read this list back verbatim):', mem);
       } else {
@@ -1187,8 +1189,8 @@ export class CallSession {
 
     // Saved from the dashboard's website scan (the owner can edit both).
     if (cfg.website_summary) {
-      const web = String(cfg.website_summary).slice(0, 6000);
-      if (web.length <= 1200) {
+      const web = String(cfg.website_summary).slice(0, retrieval ? 6000 : 3000);
+      if (!retrieval || web.length <= 1200) {
         lines.push('', 'From the business website:', web);
       } else {
         lines.push('', 'From the business website:', web.slice(0, 700).replace(/\s+\S*$/, ''));
@@ -1203,7 +1205,13 @@ export class CallSession {
         if (q && a) all.push({ q, a, entry: `Q: ${q}\nA: ${a}` });
       }
       const total = all.reduce((n, f) => n + f.entry.length, 0);
-      if (all.length && total <= Number(this.env.PROMPT_FAQ_CHARS || 1800)) {
+      if (all.length && !retrieval) {
+        // Original behaviour: as many as fit in 3000 characters.
+        const fit = [];
+        let used = 0;
+        for (const f of all) { if (used + f.entry.length > 3000) break; fit.push(f.entry); used += f.entry.length; }
+        if (fit.length) lines.push('', 'Frequently asked questions (answer from these when relevant, in your own natural words, never recite them):', ...fit);
+      } else if (all.length && total <= Number(this.env.PROMPT_FAQ_CHARS || 1800)) {
         lines.push('', 'Frequently asked questions (answer from these when relevant, in your own natural words, never recite them):', ...all.map((f) => f.entry));
       } else if (all.length) {
         // Many FAQs: list the topics so you know what is covered; the matching answers are added when the caller asks.
