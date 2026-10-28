@@ -4,11 +4,17 @@
 // is put on a cool-down so later turns skip it instantly instead of paying a
 // failed request first.
 //
-// Chain (override with LLM_CHAIN="gemini,groq,openrouter,cf"):
-//   gemini      Google Gemini free tier  (GEMINI_API_KEY,  GEMINI_MODELS)
-//   groq        Groq free tier           (GROQ_API_KEY,    GROQ_MODEL)
-//   openrouter  OpenRouter ":free" only  (OPENROUTER_API_KEY, OPENROUTER_MODELS)
-//   cf          Cloudflare Workers AI    (AI binding, CF_MAIN_MODEL)
+// Two chains, so the providers share the work instead of fighting over one quota:
+//
+//   Conversation (the agent speaking; LLM_CHAIN, default "groq,cf,openrouter,gemini")
+//     groq        fastest, so it speaks first        (GROQ_API_KEY, GROQ_MODEL)
+//     cf          Cloudflare Workers AI binding      (AI binding, CF_MAIN_MODEL)
+//     openrouter  ":free" models only, 3rd fallback  (OPENROUTER_API_KEY, OPENROUTER_MODELS)
+//     gemini      Google free tier, 4th fallback     (GEMINI_API_KEY, GEMINI_MODELS)
+//
+//   Background work (stage classifier, call summary...; LLM_BG_CHAIN, default
+//   "gemini,openrouter,cf"): runs beside the conversation on the quotas the
+//   conversation is NOT using, so it never competes with Groq's per-minute budget.
 //
 // All but `cf` speak the OpenAI chat-completions format, so one client covers them.
 
@@ -77,12 +83,12 @@ function coolDown(key, err) {
 // ── Chain construction ────────────────────────────────────────────────────────
 const list = (s) => String(s || '').split(',').map((x) => x.trim()).filter(Boolean);
 
-function buildChain(env) {
-  const order = list(env.LLM_CHAIN || 'gemini,groq,openrouter,cf');
+function buildChain(env, background = false) {
+  const order = list(background ? (env.LLM_BG_CHAIN || 'gemini,openrouter,cf') : (env.LLM_CHAIN || 'groq,cf,openrouter,gemini'));
   const chain = [];
   for (const p of order) {
     if (p === 'gemini' && env.GEMINI_API_KEY) {
-      for (const model of list(env.GEMINI_MODELS || 'gemini-2.5-flash-lite')) chain.push({ provider: 'gemini', model });
+      for (const model of list((background && env.GEMINI_BG_MODELS) || env.GEMINI_MODELS || 'gemini-2.5-flash-lite')) chain.push({ provider: 'gemini', model });
     } else if (p === 'groq' && env.GROQ_API_KEY) {
       chain.push({ provider: 'groq', model: env.GROQ_MODEL || 'openai/gpt-oss-20b' });
     } else if (p === 'openrouter' && env.OPENROUTER_API_KEY) {
@@ -92,7 +98,8 @@ function buildChain(env) {
         chain.push({ provider: 'openrouter', model });
       }
     } else if (p === 'cf' && env.AI) {
-      chain.push({ provider: 'cf', model: env.CF_MAIN_MODEL || '@cf/openai/gpt-oss-20b' });
+      // Background jobs are small, so they use a small (cheap in Neurons) model.
+      chain.push({ provider: 'cf', model: background ? (env.CF_BG_MODEL || '@cf/meta/llama-3.1-8b-instruct-fp8-fast') : (env.CF_MAIN_MODEL || '@cf/openai/gpt-oss-20b') });
     }
   }
   return chain;
@@ -222,8 +229,8 @@ async function callCloudflare(env, entry, messages, temperature, tools, override
 }
 
 // ── Public: non-streaming ─────────────────────────────────────────────────────
-async function runChainOnce(env, messages, temperature, tools, override) {
-  const chain = buildChain(env);
+async function runChainOnce(env, messages, temperature, tools, override, background = false) {
+  const chain = buildChain(env, background);
   if (!chain.length) throw new Error('No LLM provider configured');
   const failures = [];
   for (const entry of chain) {
@@ -244,9 +251,14 @@ async function runChainOnce(env, messages, temperature, tools, override) {
   throw new Error(`All LLM providers failed (${failures.join(' | ') || 'all cooling down'})`);
 }
 
-async function generateResponse(env, messages, temperature = 0.7) {
-  const r = await runChainOnce(env, messages, temperature, null, 400);
+// Background jobs (call summary, stage classifier): Gemini/OpenRouter first.
+async function generateBackground(env, messages, { temperature = 0, maxTokens = 300 } = {}) {
+  const r = await runChainOnce(env, messages, temperature, null, maxTokens, true);
   return r.content;
+}
+
+async function generateResponse(env, messages, temperature = 0.7) {
+  return generateBackground(env, messages, { temperature, maxTokens: 400 });
 }
 
 async function generateWithTools(env, messages, temperature = 0.7, tools = null) {
@@ -391,4 +403,4 @@ async function streamWithTools(env, messages, temperature = 0.7, tools = null, o
   throw new Error(`All LLM providers failed (${failures.join(' | ') || 'all cooling down'})`);
 }
 
-export { generateResponse, generateWithTools, streamWithTools };
+export { generateResponse, generateBackground, generateWithTools, streamWithTools };

@@ -4,6 +4,7 @@ import { synthesizeSpeech, streamSpeech, EMOTIONS } from '../services/tts.js';
 import { TOOL_DEFS, QUESTION_TOOL, MESSAGE_TOOL, executeTool, businessTimeZone } from '../services/tools.js';
 import { decideOutcome, buildCallSummary } from '../services/callSummary.js';
 import { classifyStage } from '../services/qualifier.js';
+import { pickRelevant, splitChunks } from '../services/knowledge.js';
 import { parseDayMention, parseTimeMention, matchSlot, dayLabel } from '../services/scheduling.js';
 import { sanitizeRules, matchRoutingRule, isValidE164 } from '../services/routing.js';
 import { telnyxTransfer, telnyxHangup } from '../services/telnyx.js';
@@ -715,6 +716,19 @@ export class CallSession {
 
   updateStage() {
     const cfg = this.agentConfig || {};
+
+    // Fast path (no model call): when the caller plainly asks to book or asks which day/time is free,
+    // they have already agreed. Skip qualifying and unlock the booking tools right now.
+    const lastUser = [...this.messages].reverse().find((m) => m.role === 'user')?.content || '';
+    if (!this.actionUnlocked && !this.bookingConfirmed && BOOKING_INTENT_RE.test(lastUser) && !/\b(don'?t|do not|not)\s+(want|need)\s+to\s+book\b/i.test(lastUser)) {
+      console.log(`[Stage] ${this.stage} -> agreed (caller asked to book)`);
+      this.stage = 'agreed';
+      this.actionUnlocked = true;
+      return Promise.resolve();
+    }
+    // Already agreed: a model call every turn adds nothing. Re-check only every third turn (to catch a change of mind).
+    if (this.actionUnlocked && this.stage === 'agreed' && this.callerTurns % 3 !== 0) return Promise.resolve();
+
     return classifyStage(this.env, this.messages, { businessName: cfg.organization_name, criteria: this.qualificationCriteria })
       .then((r) => {
         if (!r) {
@@ -923,6 +937,17 @@ export class CallSession {
       hints.push(`Availability already looked up on this call (use it, do not re-check unless the caller changes the day): ${lines}`);
     }
 
+    // Owner knowledge too long for the prompt: add only what matches what they are asking about.
+    if (this.kbFaqs?.length || this.kbWebsite?.length || this.kbMemory?.length) {
+      const recent = this.messages.filter((m) => m.role === 'user').slice(-2).map((m) => m.content).join(' ');
+      const picks = [
+        ...pickRelevant(this.kbFaqs, recent, 900, 3),
+        ...pickRelevant(this.kbMemory, recent, 500, 2),
+        ...pickRelevant(this.kbWebsite, recent, 500, 2),
+      ];
+      if (picks.length) hints.push(`Notes that match what they are asking about (use in your own words, never read out, never go beyond them):\n${picks.join('\n---\n')}`);
+    }
+
     const nameHint = this.nameHint();
     if (nameHint) hints.push(nameHint);
     else if (this.callerName && !this.bookingConfirmed) hints.push(`The caller's name is ${this.callerName}. Use it rarely and naturally (see the earlier rule), never ask for it again.`);
@@ -1083,6 +1108,10 @@ export class CallSession {
 
   buildSystemPrompt(voiceSettings, agentConfig, systemPrompts) {
     const cfg = agentConfig || {};
+    // Long owner knowledge is not pasted whole: the best-matching pieces are added per turn (see buildDynamicHints).
+    this.kbFaqs = [];
+    this.kbWebsite = [];
+    this.kbMemory = [];
     const orgName = cfg.organization_name || 'this business';
     const nickname = cfg.agent_nickname ? ` named ${cfg.agent_nickname}` : '';
     const position = cfg.agent_position || voiceSettings.agent_persona || 'receptionist';
@@ -1145,27 +1174,44 @@ export class CallSession {
     // generated via the "scan my website" feature -- this is the actual
     // fix for "the agent has no memory of the business it's answering for".
     if (cfg.memory_context) {
-      lines.push('', 'What you know about this business (use naturally, do not read this list back verbatim):', cfg.memory_context);
+      const mem = String(cfg.memory_context);
+      const MEM_INLINE = Number(this.env.PROMPT_MEMORY_CHARS || 2500);
+      if (mem.length <= MEM_INLINE) {
+        lines.push('', 'What you know about this business (use naturally, do not read this list back verbatim):', mem);
+      } else {
+        // Keep the opening (usually who/what/where they are), retrieve the rest when it matters.
+        lines.push('', 'What you know about this business (use naturally, do not read this list back verbatim):', mem.slice(0, 1500).replace(/\s+\S*$/, ''));
+        this.kbMemory = splitChunks(mem.slice(1500));
+      }
     }
 
     // Saved from the dashboard's website scan (the owner can edit both).
     if (cfg.website_summary) {
-      lines.push('', 'From the business website:', String(cfg.website_summary).slice(0, 3000));
+      const web = String(cfg.website_summary).slice(0, 6000);
+      if (web.length <= 1200) {
+        lines.push('', 'From the business website:', web);
+      } else {
+        lines.push('', 'From the business website:', web.slice(0, 700).replace(/\s+\S*$/, ''));
+        this.kbWebsite = splitChunks(web.slice(700));
+      }
     }
     if (Array.isArray(cfg.faqs) && cfg.faqs.length) {
-      const faqLines = [];
-      let used = 0;
+      const all = [];
       for (const f of cfg.faqs) {
         const q = String(f?.q || '').trim();
         const a = String(f?.a || '').trim();
-        if (!q || !a) continue;
-        const entry = `Q: ${q}\nA: ${a}`;
-        if (used + entry.length > 3000) break; // keep the prompt (and replies) fast
-        faqLines.push(entry);
-        used += entry.length;
+        if (q && a) all.push({ q, a, entry: `Q: ${q}\nA: ${a}` });
       }
-      if (faqLines.length) {
-        lines.push('', 'Frequently asked questions (answer from these when relevant, in your own natural words, never recite them):', ...faqLines);
+      const total = all.reduce((n, f) => n + f.entry.length, 0);
+      if (all.length && total <= Number(this.env.PROMPT_FAQ_CHARS || 1800)) {
+        lines.push('', 'Frequently asked questions (answer from these when relevant, in your own natural words, never recite them):', ...all.map((f) => f.entry));
+      } else if (all.length) {
+        // Many FAQs: list the topics so you know what is covered; the matching answers are added when the caller asks.
+        this.kbFaqs = all.slice(0, 60).map((f) => f.entry);
+        const topics = [];
+        let n = 0;
+        for (const f of all.slice(0, 60)) { const t = f.q.slice(0, 80); if (n + t.length > 1200) break; topics.push(t); n += t.length; }
+        lines.push('', 'You have saved answers on these topics (the exact answer appears in your notes when the caller asks about one; never invent details beyond it):', topics.join(' | '));
       }
     }
 
@@ -1329,6 +1375,9 @@ function bytesToBase64(bytes) {
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
   return btoa(binary);
 }
+
+// Plain-language signals that the caller wants to book / asks about open times.
+const BOOKING_INTENT_RE = /\b(book|booking|schedule|appointment|reserve|set up (a|an) (time|visit|meeting|consultation)|which (day|days|time|times) (is|are|will|do|can|works?)|what (day|days) (is|are|will|can)|what (time|times) (are|is) (you|there|available|free)|any (day|days|slot|slots|openings?)|(have|got) (an? )?(openings?|slots?|spots?)|your availability|when (can|could|do) (i|we) (come|see|get|visit)|(can|could) i (come|see|get) (in|seen)|get it done|sign me up|let'?s book)\b/i;
 
 const STILL_THERE_LINES = [
   'Hello? Are you still there?',
