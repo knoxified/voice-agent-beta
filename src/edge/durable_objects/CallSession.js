@@ -1,7 +1,7 @@
 import { createLiveTranscription, sendAudio as sendToDeepgram, keepAlive } from '../services/stt.js';
 import { generateWithTools, streamWithTools } from '../services/llm.js';
 import { synthesizeSpeech, streamSpeech, EMOTIONS } from '../services/tts.js';
-import { TOOL_DEFS, QUESTION_TOOL, MESSAGE_TOOL, executeTool, businessTimeZone } from '../services/tools.js';
+import { TOOL_DEFS, QUESTION_TOOL, MESSAGE_TOOL, NAME_TOOL, executeTool, businessTimeZone } from '../services/tools.js';
 import { decideOutcome, buildCallSummary } from '../services/callSummary.js';
 import { classifyStage } from '../services/qualifier.js';
 import { pickRelevant, splitChunks } from '../services/knowledge.js';
@@ -90,6 +90,9 @@ export class CallSession {
     this.callerTurns = 0;
     // Caller-name capture: ask early and naturally (see nameHint()).
     this.callerName = null;
+    this.confirmedName = null;   // set by set_caller_name; beats anything guessed
+    this.nameCorrectionTurn = 0;
+    this.bookingFailed = false;
     this.nameDeclined = false;
     this.nameAsks = 0;        // times the agent actually asked
     this.nameAskedTurn = 0;   // callerTurns value when it last asked
@@ -523,7 +526,7 @@ export class CallSession {
       let finalSpeaker = null;
 
       for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
-        const toolList = round < MAX_TOOL_ROUNDS ? (this.actionUnlocked ? [...TOOL_DEFS, QUESTION_TOOL, MESSAGE_TOOL] : [QUESTION_TOOL, MESSAGE_TOOL]) : null;
+        const toolList = round < MAX_TOOL_ROUNDS ? (this.actionUnlocked ? [...TOOL_DEFS, NAME_TOOL, QUESTION_TOOL, MESSAGE_TOOL] : [NAME_TOOL, QUESTION_TOOL, MESSAGE_TOOL]) : null;
 
         // Speak each sentence as the model writes it, so the first words reach
         // the caller while the rest is still being generated. If streaming
@@ -551,7 +554,7 @@ export class CallSession {
           if (result.streamedLeadIn) {
             this.pushAssistant(speaker.text()); // already spoken while streaming
           } else {
-            await this.speakFiller(result.content || pickFiller(first));
+            { const f = result.content || pickFiller(first); if (f) await this.speakFiller(f); }
           }
 
           // Run all tool calls in parallel — most turns only have one, but
@@ -822,8 +825,13 @@ export class CallSession {
   // Deliberately conservative: the model still sees the whole conversation
   // and is told not to ask if the name was already given.
   noteCallerName(transcript) {
-    if (this.callerName) return;
     const text = String(transcript || '').trim();
+    // Correcting or spelling a name (even after one was captured): flag this turn so the agent records it.
+    if (/\b(that'?s not|not (right|correct|my name)|no[, ]+(it'?s|its|my name)|it'?s spelled|spelled|spell(ing)?|with an? [a-z]\b|my (first|last|sur)name)\b/i.test(text)
+        || /\b(?:[A-Za-z][\s.,-]+){3,}[A-Za-z]\b/.test(text.replace(/\b[A-Za-z]{2,}\b/g, ''))) {
+      this.nameCorrectionTurn = this.callerTurns;
+    }
+    if (this.callerName) return;
     const NOT_NAMES = /^(calling|looking|trying|interested|just|here|not|sorry|good|fine|great|well|wondering|hoping|having|in|a|an|the|from|at|with|new|sure|yes|yeah|okay|ok|hi|hello|hey|thanks|thank|um|uh|so|really|actually|also|about|going|getting|needing|wanting|worried|calling|ready|back|late|on|for|to|and|but|it|that|this|how|what|when|where|why|who|please|real|dental|glad|happy|afraid|concerned|curious|thinking)$/i;
     const cap = (w) => /^[A-Z][a-z'’-]{1,18}$/.test(w) && !NOT_NAMES.test(w);
 
@@ -946,6 +954,15 @@ export class CallSession {
         ...pickRelevant(this.kbWebsite, recent, 500, 2),
       ];
       if (picks.length) hints.push(`Notes that match what they are asking about (use in your own words, never read out, never go beyond them):\n${picks.join('\n---\n')}`);
+    }
+
+    if (this.nameCorrectionTurn === this.callerTurns && this.callerTurns > 0) {
+      hints.push('The caller is giving, correcting or spelling their name. Call set_caller_name NOW with exactly what they said or spelled (the corrected spelling replaces any earlier one), then read it back letter by letter once and ask if that is right. Do not carry on with anything else until they confirm, and never keep using the old spelling.');
+    } else if (this.confirmedName && !this.bookingConfirmed) {
+      hints.push(`The caller's confirmed name is ${this.confirmedName}. Use exactly this spelling everywhere.`);
+    }
+    if (this.bookingFailed && !this.followUp && this.callerTurns - (this.bookingFailedTurn || 0) <= 3) {
+      hints.push('Booking could not be completed. If you have not already, offer the follow-up now in your own words and follow the tool instruction (phone call: this number or email; web call: email or number, and always the country code for a number). If they decline, drop it kindly.');
     }
 
     const nameHint = this.nameHint();
@@ -1143,7 +1160,7 @@ export class CallSession {
       '- If you do not know something, say so plainly and offer to have someone follow up.',
       '- If someone starts to give their name but you did not catch it (cut off or unclear), say so naturally and ask once, for example "Sorry, I missed your name, could you say it again?". Never carry on as if you heard it.',
       '- Never decide a caller is out of scope on your own. Ask what they mean first. Never say "that is outside our scope" or "take care" as a way to wrap up, and never offer to end the call. Only say goodbye once the caller is wrapping up.',
-      '- Whenever you say the team will follow up, call them back or send something, first use take_message. On a web call you have no phone number: ask for the best number or email, read it back, get a yes, then use it. On a phone call you already have their number, so do not ask for it.',
+      '- Whenever you say the team will follow up, call them back or send something, first use take_message. On a web call you have no phone number: ask whether they would like you to get back to them by email or by number, read it back, get a yes, then use it; after any number always ask for the country code and read it back with the code. On a phone call you already have their number, so do not ask for it (offer it, or email, instead).',
       '- If someone says "help" or sounds distressed, slow down, say something caring, and ask what is happening before anything else.',
       '- Ending the call: when the caller has clearly finished (says bye, thanks that is all, nothing else) give one short warm goodbye and put the exact marker [END] at the very end of that final message. Use [END] only for that final goodbye, never mid-conversation, and never mention it. Do not offer more help after they have said they are done.',
       '- You are an AI and the greeting already said so. Never pretend to be human, and if someone sincerely asks whether you are a person, tell them the truth in one calm sentence and carry on.',
@@ -1320,7 +1337,7 @@ export class CallSession {
           tone: analysis.tone,
           summary,
           appointmentBooked: outcome === 'booked',
-          name: this.capturedContact?.name || this.followUp?.name || analysis.name,
+          name: this.confirmedName || this.capturedContact?.name || this.followUp?.name || analysis.name,
           email: this.capturedContact?.email || null,
           followUp: this.followUp,
         };
@@ -1409,6 +1426,7 @@ function pickRandom(arr) {
 }
 
 function pickFiller(toolName) {
+  if (toolName === 'set_caller_name') return ''; // instant and silent
   return pickRandom(FILLERS[toolName] || ['One moment.']);
 }
 

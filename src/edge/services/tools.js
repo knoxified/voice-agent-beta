@@ -58,6 +58,25 @@ export const MESSAGE_TOOL = {
   },
 };
 
+// The caller's name, as THEY say or spell it. One source of truth: booking, follow-ups and the
+// lead all use this, so a correction made mid-call is never lost.
+export const NAME_TOOL = {
+  type: 'function',
+  function: {
+    name: 'set_caller_name',
+    description:
+      'Call whenever the caller tells you their name, corrects it, or spells it out. Pass the full name exactly as they said or spelled it (for example if they spell F, A, V, O, R then use that spelling). Call it again after every correction. Do not use it for anyone but the caller.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: "The caller's name exactly as they said or spelled it." },
+        spelled_out: { type: 'boolean', description: 'true if they spelled it letter by letter.' },
+      },
+      required: ['name'],
+    },
+  },
+};
+
 export const QUESTION_TOOL = {
   type: 'function',
   function: {
@@ -172,11 +191,48 @@ export async function executeTool(session, call) {
     return { ok: false, error: 'bad_arguments', instruction: 'Ask the caller to repeat the details, then try again.' };
   }
 
-  if (name === 'check_availability') return runAvailability(session, args);
-  if (name === 'book_appointment') return runBooking(session, args);
+  if (name === 'set_caller_name') return runSetName(session, args);
   if (name === 'take_question') return runTakeQuestion(session, args);
   if (name === 'take_message') return runTakeMessage(session, args);
+  if (name === 'check_availability' || name === 'book_appointment') {
+    const result = name === 'check_availability' ? await runAvailability(session, args) : await runBooking(session, args);
+    // The system could not do it (not the caller's mistake): offer the follow-up right away, the way a person would.
+    if (result && result.ok === false && SYSTEM_FAILURES.has(result.error)) {
+      session.bookingFailed = true;
+      session.bookingFailedTurn = session.callerTurns || 0;
+      return { ...result, instruction: followUpInstruction(session, result.instruction) };
+    }
+    return result;
+  }
   return { ok: false, error: 'unknown_tool' };
+}
+
+const SYSTEM_FAILURES = new Set(['service_unavailable', 'lookup_failed', 'booking_failed', 'limit_reached']);
+const COUNTRY_CODE_RULE = 'Whenever you collect a phone number, also ask which country code it has, then read the whole number back WITH the code (plus sign, code, number) and get a yes before using it.';
+
+function hasCallerNumber(session) {
+  return !!(session.callerNumber && String(session.callerNumber).replace(/\D/g, '').length >= 6);
+}
+
+// What to say when we cannot complete something and the team has to follow up.
+function followUpInstruction(session, original) {
+  const failed = 'Say briefly that you could not complete that right now. Never claim it worked.';
+  if (hasCallerNumber(session)) {
+    return `${failed} Then offer, in your own words: "I can have the team reach out to you on this number if you are okay with that, or would you prefer email?" If they are fine with this number, use take_message (include what they wanted, and the time if there was one). If they prefer email, ask for it, read it back letter by letter, get a yes, then use take_message with callback_email.`;
+  }
+  return `${failed} Say this is a web call, so you do not have their number, and ask: "would you like me to get back to you by email or by number?" Email: ask for it, read it back letter by letter, get a yes, then use take_message with callback_email. Number: ${COUNTRY_CODE_RULE} Then use take_message with callback_phone including the plus and country code. (${String(original || '').slice(0, 120)})`;
+}
+
+async function runSetName(session, args) {
+  const name = String(args.name || '').replace(/[^A-Za-z\u00C0-\u024F'’ .-]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80);
+  if (name.length < 2) return { ok: false, error: 'bad_name', instruction: 'Ask them to say or spell their name again, slowly.' };
+  session.confirmedName = name;
+  session.callerName = name;
+  const letters = name.replace(/[^A-Za-z]/g, '').split('').join(', ').toUpperCase();
+  return {
+    ok: true,
+    instruction: `Name saved as "${name}". Read it back once, letter by letter for the part that was unclear (${letters}), and ask if that is right. If they say yes, carry on and use this name for everything. If not, ask them to spell it slowly and call set_caller_name again. Never keep using an old spelling after they corrected it.`,
+  };
 }
 
 
@@ -185,8 +241,17 @@ async function runTakeMessage(session, args) {
   if (message.length < 4) {
     return { ok: false, error: 'empty_message', instruction: 'Ask what they would like the team to follow up about.' };
   }
-  const digits = String(args.callback_phone || '').replace(/\D/g, '');
-  const phone = digits.length >= 7 && digits.length <= 15 ? (String(args.callback_phone).trim().startsWith('+') ? '+' : '') + digits : '';
+  const rawPhone = String(args.callback_phone || '').trim();
+  const digits = rawPhone.replace(/\D/g, '');
+  let phone = '';
+  if (digits.length >= 7 && digits.length <= 15) {
+    const hasPlus = rawPhone.startsWith('+');
+    // No country code (local format starting 0, or a short number): ask for it, never store an ambiguous number.
+    if (!hasPlus && (digits.startsWith('0') || digits.length < 11)) {
+      return { ok: false, error: 'need_country_code', instruction: `Ask which country code that number has (for example plus two three four for Nigeria, plus one for the US or Canada). ${COUNTRY_CODE_RULE} Then call this again with the number written as +code then number.` };
+    }
+    phone = `+${digits}`;
+  }
   const email = String(args.callback_email || '').trim().toLowerCase();
   const emailOk = EMAIL_RE.test(email) ? email : '';
   const hasCallerId = !!(session.callerNumber && String(session.callerNumber).replace(/\D/g, '').length >= 6);
@@ -195,14 +260,16 @@ async function runTakeMessage(session, args) {
     return {
       ok: false,
       error: 'need_contact',
-      instruction: 'You have no way to reach them yet. Ask for the best phone number or email, read it back digit by digit or letter by letter, and call this again once they say yes.',
+      instruction: hasCallerNumber(session)
+        ? 'Ask whether the team may reach them on the number they are calling from, or whether they would prefer email. Read an email back letter by letter and get a yes before calling this again.'
+        : `This is a web call, so you have no way to reach them yet. Ask whether they would like you to get back to them by email or by number. Read an email back letter by letter. ${COUNTRY_CODE_RULE} Call this again once they say yes.`,
     };
   }
   session.followUp = {
     message,
     phone: phone || null,
     email: emailOk || null,
-    name: String(args.name || '').trim().slice(0, 80) || null,
+    name: String(session.confirmedName || args.name || '').trim().slice(0, 80) || null,
   };
   return {
     ok: true,
@@ -232,7 +299,7 @@ async function runTakeQuestion(session, args) {
     return {
       ok: true,
       noted: true,
-      instruction: 'Say plainly that you do not have that information (for example "I don\'t have the exact answer on that one"). Then, in the same reply, ask for the best email or number so the team can confirm it, and tell them to take it slowly. Read it back once. When they say yes, use take_message with it and what they asked. Do not guess an answer. If they do not want to give one, drop it and keep helping.',
+      instruction: 'Say plainly that you do not have that information (for example "I don\'t have the exact answer on that one"). Then, in the same reply, ask whether they would like the team to get back to them by email or by number. Read an email back letter by letter. For a number also ask the country code and read it back with the code. When they say yes, use take_message with it and what they asked. Do not guess an answer. If they do not want to give one, drop it and keep helping.',
     };
   }
   return {
@@ -323,7 +390,7 @@ async function runBooking(session, args) {
   const tz = businessTimeZone(session);
   // The time the caller chose is locked in by the code; the model cannot drift from it.
   if (session.selectedSlot) args = { ...args, date: session.selectedSlot.date, time: session.selectedSlot.time };
-  const name = String(args.name || '').trim();
+  const name = String(session.confirmedName || args.name || '').trim(); // a correction made mid-call always wins
   const email = String(args.email || '').trim().toLowerCase();
   const date = String(args.date || '').trim();
   const time = String(args.time || '').trim();
