@@ -129,8 +129,22 @@ export const TOOL_DEFS = [
   },
 ];
 
+function validTimeZone(tz) {
+  if (!tz || typeof tz !== 'string') return false;
+  try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return true; } catch { return false; }
+}
+
+// The business's own timezone (agent_configs.timezone, set on the dashboard voice config page).
+// Used ONLY for availability, booking times and working out what "Monday"/"tomorrow" means.
 export function businessTimeZone(session) {
-  return session.agentConfig?.timezone || session.env?.DEFAULT_TIMEZONE || 'Africa/Lagos';
+  const tz = session.agentConfig?.timezone;
+  if (validTimeZone(tz)) return tz;
+  if (!session._tzWarned) {
+    session._tzWarned = true;
+    console.warn(tz ? `[TZ] invalid timezone "${tz}" on this tenant, using the default` : '[TZ] no timezone set for this business, using the default');
+  }
+  const fallback = session.env?.DEFAULT_TIMEZONE;
+  return validTimeZone(fallback) ? fallback : 'Africa/Lagos';
 }
 
 // ---- timezone helpers (no libraries; Workers has Intl) ----------------------
