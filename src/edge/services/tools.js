@@ -7,6 +7,7 @@
 import { triggerAutomation } from './n8n.js';
 import { rangesLabels } from './scheduling.js';
 import { logPendingQuestion } from './supabase.js';
+import { pickRelevant } from './knowledge.js';
 
 const MAX_AVAILABILITY_CHECKS = 4; // per call (1 credit each)
 const MAX_BOOKINGS = 2; // per call (2 credits each)
@@ -55,6 +56,16 @@ export const MESSAGE_TOOL = {
       },
       required: ['message'],
     },
+  },
+};
+
+// Only offered when the owner's knowledge is too long to paste (PROMPT_RETRIEVAL=1): the agent asks for what it needs.
+export const LOOKUP_TOOL = {
+  type: 'function',
+  function: {
+    name: 'lookup_business_info',
+    description: 'Look up what you have on a business topic (prices, services, policies, hours, location, procedures) before answering a factual question. Pass a short topic in the caller\'s words.',
+    parameters: { type: 'object', properties: { topic: { type: 'string', description: 'Short topic, e.g. "teeth whitening price".' } }, required: ['topic'] },
   },
 };
 
@@ -192,6 +203,7 @@ export async function executeTool(session, call) {
   }
 
   if (name === 'set_caller_name') return runSetName(session, args);
+  if (name === 'lookup_business_info') return runLookup(session, args);
   if (name === 'take_question') return runTakeQuestion(session, args);
   if (name === 'take_message') return runTakeMessage(session, args);
   if (name === 'check_availability' || name === 'book_appointment') {
@@ -221,6 +233,19 @@ function followUpInstruction(session, original) {
     return `${failed} Then offer, in your own words: "I can have the team reach out to you on this number if you are okay with that, or would you prefer email?" If they are fine with this number, use take_message (include what they wanted, and the time if there was one). If they prefer email, ask for it, read it back letter by letter, get a yes, then use take_message with callback_email.`;
   }
   return `${failed} Say this is a web call, so you do not have their number, and ask: "would you like me to get back to you by email or by number?" Email: ask for it, read it back letter by letter, get a yes, then use take_message with callback_email. Number: ${COUNTRY_CODE_RULE} Then use take_message with callback_phone including the plus and country code. (${String(original || '').slice(0, 120)})`;
+}
+
+async function runLookup(session, args) {
+  const topic = String(args.topic || '').slice(0, 160);
+  const found = [
+    ...pickRelevant(session.kbFaqs || [], topic, 900, 3),
+    ...pickRelevant(session.kbMemory || [], topic, 600, 2),
+    ...pickRelevant(session.kbWebsite || [], topic, 600, 2),
+  ];
+  if (!found.length) {
+    return { ok: true, found: false, instruction: 'You have nothing on that. Say so plainly, do not guess, and use take_question so the team can follow up.' };
+  }
+  return { ok: true, found: true, notes: found.join('\n---\n'), instruction: 'Answer from these notes in your own words, briefly. Do not go beyond them and do not read them out.' };
 }
 
 async function runSetName(session, args) {

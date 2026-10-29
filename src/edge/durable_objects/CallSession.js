@@ -1,7 +1,7 @@
 import { createLiveTranscription, sendAudio as sendToDeepgram, keepAlive } from '../services/stt.js';
 import { generateWithTools, streamWithTools } from '../services/llm.js';
 import { synthesizeSpeech, streamSpeech, EMOTIONS } from '../services/tts.js';
-import { TOOL_DEFS, QUESTION_TOOL, MESSAGE_TOOL, NAME_TOOL, executeTool, businessTimeZone } from '../services/tools.js';
+import { TOOL_DEFS, QUESTION_TOOL, MESSAGE_TOOL, NAME_TOOL, LOOKUP_TOOL, executeTool, businessTimeZone } from '../services/tools.js';
 import { decideOutcome, buildCallSummary } from '../services/callSummary.js';
 import { classifyStage } from '../services/qualifier.js';
 import { pickRelevant, splitChunks } from '../services/knowledge.js';
@@ -533,7 +533,8 @@ export class CallSession {
       let finalSpeaker = null;
 
       for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
-        const toolList = round < MAX_TOOL_ROUNDS ? (this.actionUnlocked ? [...TOOL_DEFS, NAME_TOOL, QUESTION_TOOL, MESSAGE_TOOL] : [NAME_TOOL, QUESTION_TOOL, MESSAGE_TOOL]) : null;
+        const lookup = (this.kbFaqs?.length || this.kbWebsite?.length || this.kbMemory?.length) ? [LOOKUP_TOOL] : [];
+          const toolList = round < MAX_TOOL_ROUNDS ? (this.actionUnlocked ? [...TOOL_DEFS, NAME_TOOL, ...lookup, QUESTION_TOOL, MESSAGE_TOOL] : [NAME_TOOL, ...lookup, QUESTION_TOOL, MESSAGE_TOOL]) : null;
 
         // Speak each sentence as the model writes it, so the first words reach
         // the caller while the rest is still being generated. If streaming
@@ -1276,7 +1277,7 @@ export class CallSession {
         const topics = [];
         let n = 0;
         for (const f of all.slice(0, 60)) { const t = f.q.slice(0, 80); if (n + t.length > 1200) break; topics.push(t); n += t.length; }
-        lines.push('', 'You have saved answers on these topics (the exact answer appears in your notes when the caller asks about one; never invent details beyond it):', topics.join(' | '));
+        lines.push('', 'You have saved answers on these topics (the exact answer appears in your notes when the caller asks about one, or call lookup_business_info; never invent details beyond it):', topics.join(' | '));
       }
     }
 
@@ -1481,6 +1482,7 @@ function pickRandom(arr) {
 
 function pickFiller(toolName) {
   if (toolName === 'set_caller_name') return ''; // instant and silent
+  if (toolName === 'lookup_business_info') return pickRandom(['Let me check.', 'One sec.', 'Let me see.']);
   return pickRandom(FILLERS[toolName] || ['One moment.']);
 }
 
