@@ -221,7 +221,11 @@ async function callCloudflare(env, entry, messages, temperature, tools, override
     else throw err;
   }
 
-  // Workers AI answers in a few shapes depending on model/version.
+  return parseCfResult(out);
+}
+
+// Workers AI answers in a few shapes depending on model/version.
+function parseCfResult(out) {
   const msg = out?.choices?.[0]?.message;
   const items = Array.isArray(out?.output) ? out.output : [];
   const itemText = items.filter((o) => o?.type === 'message').flatMap((o) => (Array.isArray(o.content) ? o.content : []))
@@ -231,6 +235,148 @@ async function callCloudflare(env, entry, messages, temperature, tools, override
   const toolCalls = normaliseCalls(raw.map((tc) => ({ id: tc.id || tc.call_id, function: tc.function || { name: tc.name, arguments: tc.arguments } })));
   if (!content && !toolCalls) console.error(`[LLM] cf empty reply (finish: ${out?.choices?.[0]?.finish_reason || '?'}, keys: ${Object.keys(out || {}).join(',')})`);
   return { content, toolCalls, finish: out?.choices?.[0]?.finish_reason };
+}
+
+
+
+// ── Cloudflare Workers AI, streamed ───────────────────────────────────────────
+// Same promise as the other providers: the caller hears each sentence as soon as
+// it is written. Workers AI streams in a few event shapes (legacy {response},
+// chat {choices[0].delta}, Responses API {type: response.*}); all are read here.
+// If a stream yields nothing usable we fall back to the one-shot call, so this
+// can only make the Cloudflare path faster, never worse.
+async function streamCloudflare(env, entry, messages, temperature, tools, onSentence) {
+  const payload = { messages: flattenForCF(messages), max_tokens: tools?.length ? 900 : 600, temperature, stream: true };
+  if (tools?.length) payload.tools = tools;
+  let out;
+  try {
+    out = await env.AI.run(entry.model, { ...payload, reasoning_effort: 'low' });
+  } catch (err) {
+    if (/reasoning|unknown|unexpected|additional/i.test(String(err?.message))) out = await env.AI.run(entry.model, payload);
+    else throw err;
+  }
+
+  // Some models ignore stream:true and answer in one object.
+  if (!out || typeof out.getReader !== 'function') {
+    const r = parseCfResult(out);
+    if (!r.content && !r.toolCalls) throw new LlmError('cf empty reply');
+    return { content: r.content, toolCalls: r.toolCalls, streamedAny: false };
+  }
+
+  const reader = out.getReader();
+  const dec = new TextDecoder();
+  const started = Date.now();
+  let first = setTimeout(() => { try { reader.cancel(); } catch { /* ignore */ } }, 8000);
+  const overall = setTimeout(() => { try { reader.cancel(); } catch { /* ignore */ } }, OVERALL_MS);
+
+  let buf = '';
+  let full = '';
+  let pending = '';
+  let sawTool = false;
+  let streamedAny = false;
+  let usage = null;
+  const calls = [];
+  const byItem = new Map();
+
+  const text = async (t) => {
+    if (!t) return;
+    full += t;
+    if (sawTool) return;
+    pending += t;
+    const { sentences, rest } = takeSentences(pending);
+    pending = rest;
+    for (const sen of sentences) { streamedAny = true; await onSentence(sen, false); }
+  };
+  const callAt = (i) => (calls[i] = calls[i] || { id: '', type: 'function', function: { name: '', arguments: '' } });
+
+  const handle = async (j) => {
+    if (j.usage) usage = j.usage;
+    // chat-completions style
+    const d = j.choices?.[0]?.delta;
+    if (d) {
+      if (d.tool_calls?.length) {
+        sawTool = true;
+        for (const tc of d.tool_calls) {
+          const c = callAt(tc.index ?? 0);
+          if (tc.id) c.id = tc.id;
+          if (tc.function?.name) c.function.name += tc.function.name;
+          if (tc.function?.arguments) c.function.arguments += typeof tc.function.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function.arguments);
+        }
+      }
+      if (typeof d.content === 'string') await text(d.content);
+      return;
+    }
+    // Responses-API style
+    if (j.type === 'response.output_text.delta' && typeof j.delta === 'string') return text(j.delta);
+    if (j.type === 'response.output_item.added' && j.item?.type === 'function_call') {
+      sawTool = true;
+      const i = calls.length;
+      byItem.set(j.item.id || j.item.call_id || String(i), i);
+      const c = callAt(i);
+      c.id = j.item.call_id || j.item.id || '';
+      c.function.name = j.item.name || '';
+      return;
+    }
+    if (j.type === 'response.function_call_arguments.delta') {
+      const i = byItem.get(j.item_id) ?? (calls.length - 1);
+      if (i >= 0 && typeof j.delta === 'string') callAt(i).function.arguments += j.delta;
+      return;
+    }
+    if (j.type === 'response.function_call_arguments.done') {
+      const i = byItem.get(j.item_id) ?? (calls.length - 1);
+      if (i >= 0 && typeof j.arguments === 'string') callAt(i).function.arguments = j.arguments;
+      return;
+    }
+    // legacy style
+    if (typeof j.response === 'string') await text(j.response);
+    if (Array.isArray(j.tool_calls) && j.tool_calls.length) {
+      sawTool = true;
+      for (const tc of j.tool_calls) {
+        const c = callAt(calls.length);
+        c.id = tc.id || '';
+        c.function.name = tc.name || tc.function?.name || '';
+        const a = tc.arguments ?? tc.function?.arguments;
+        c.function.arguments = typeof a === 'string' ? a : JSON.stringify(a ?? {});
+      }
+    }
+  };
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (first) { clearTimeout(first); first = null; }
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        let line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (line.startsWith('data:')) line = line.slice(5).trim();
+        if (!line || line === '[DONE]' || line[0] !== '{') continue;
+        let j;
+        try { j = JSON.parse(line); } catch { continue; }
+        await handle(j);
+      }
+    }
+  } finally {
+    if (first) clearTimeout(first);
+    clearTimeout(overall);
+  }
+
+  const toolCalls = normaliseCalls(calls);
+  if (!toolCalls && pending.trim()) { streamedAny = true; await onSentence(pending.trim(), true); }
+  const content = full.trim() || null;
+
+  if (!content && !toolCalls) {
+    if (streamedAny) throw new LlmError('cf stream ended empty');
+    // Nothing usable arrived: one-shot retry on the same model, as before.
+    console.warn('[LLM] cf stream produced nothing, retrying without streaming');
+    const r = await callCloudflare(env, entry, messages, temperature, tools, null);
+    if (!r.content && !r.toolCalls) throw new LlmError('cf empty reply');
+    return { content: r.content, toolCalls: r.toolCalls, streamedAny: false };
+  }
+  if (usage) console.log(`[LLM] cf/${entry.model} tokens: prompt ${usage.prompt_tokens ?? '?'} + out ${usage.completion_tokens ?? '?'}, ${Date.now() - started}ms total (streamed)`);
+  return { content, toolCalls, streamedAny };
 }
 
 // ── Public: non-streaming ─────────────────────────────────────────────────────
@@ -383,13 +529,9 @@ async function streamWithTools(env, messages, temperature = 0.7, tools = null, o
     const key = `${entry.provider}:${entry.model}`;
     if (isCooling(key)) continue;
     try {
-      if (entry.provider === 'cf') {
-        const r = await callCloudflare(env, entry, messages, temperature, tools, null);
-        if (!r.content && !r.toolCalls) { failures.push(`${key}: empty`); continue; }
-        console.log(`[LLM] answered by ${key} (not streamed)`);
-        return { content: r.content, toolCalls: r.toolCalls, assistantMessage: r.toolCalls ? { role: 'assistant', content: r.content ?? null, tool_calls: r.toolCalls } : null, streamed: false, streamedLeadIn: false };
-      }
-      const r = await streamCompat(env, entry, messages, temperature, tools, tracked);
+      const r = entry.provider === 'cf'
+        ? await streamCloudflare(env, entry, messages, temperature, tools, tracked)
+        : await streamCompat(env, entry, messages, temperature, tools, tracked);
       if (!r.content && !r.toolCalls) { failures.push(`${key}: empty`); continue; }
       console.log(`[LLM] answered by ${key}`);
       return {
