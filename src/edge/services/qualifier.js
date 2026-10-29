@@ -11,7 +11,8 @@ import { generateBackground } from './llm.js';
 const STAGES = new Set(['discover', 'qualified', 'agreed', 'declined', 'not_fit']);
 
 const SYSTEM = `You judge phone conversations for a business. Decide the caller's CURRENT stage.
-Reply with JSON only: {"stage":"discover|qualified|agreed|declined|not_fit","reason":"max 8 words"}
+Reply with JSON only: {"stage":"discover|qualified|agreed|declined|not_fit","reason":"max 8 words","caller_mood":"neutral|upset|worried|in_pain|angry|urgent|excited|happy|confused"}
+Also judge how the CALLER feels right now from their latest words (caller_mood); use "neutral" unless it is clear.
 
 Stages:
 - discover: still learning what the caller needs, small talk, or the need is vague.
@@ -26,7 +27,8 @@ Be slow to choose "not_fit": use it only for a wrong number, spam, abuse, or som
 function parseVerdict(text) {
   const parsed = JSON.parse((String(text || '').match(/\{[\s\S]*\}/) || ['{}'])[0]);
   if (!STAGES.has(parsed.stage)) throw new Error('unusable verdict');
-  return { stage: parsed.stage, reason: String(parsed.reason || '').slice(0, 80) };
+  const MOODS = new Set(['neutral', 'upset', 'worried', 'in_pain', 'angry', 'urgent', 'excited', 'happy', 'confused']);
+  return { stage: parsed.stage, reason: String(parsed.reason || '').slice(0, 80), caller_mood: MOODS.has(parsed.caller_mood) ? parsed.caller_mood : 'neutral' };
 }
 
 // Runs on the BACKGROUND chain (Gemini, then OpenRouter ":free", then a small

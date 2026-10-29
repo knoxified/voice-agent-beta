@@ -90,7 +90,12 @@ function buildChain(env, background = false) {
     if (p === 'gemini' && env.GEMINI_API_KEY) {
       for (const model of list((background && env.GEMINI_BG_MODELS) || env.GEMINI_MODELS || 'gemini-2.5-flash-lite')) chain.push({ provider: 'gemini', model });
     } else if (p === 'groq' && env.GROQ_API_KEY) {
-      chain.push({ provider: 'groq', model: env.GROQ_MODEL || 'openai/gpt-oss-20b' });
+      // Groq counts limits PER MODEL, so several models = several separate buckets, all fast.
+      // Set GROQ_MODELS="a,b,c" to choose; a model your key cannot use is skipped for 6 hours.
+      const groqModels = env.GROQ_MODELS
+        ? list(env.GROQ_MODELS)
+        : [env.GROQ_MODEL || 'openai/gpt-oss-20b', 'openai/gpt-oss-120b', 'llama-3.1-8b-instant'];
+      for (const model of [...new Set(groqModels)]) chain.push({ provider: 'groq', model });
     } else if (p === 'openrouter' && env.OPENROUTER_API_KEY) {
       for (const model of list(env.OPENROUTER_MODELS || 'openai/gpt-oss-20b:free,google/gemma-4-26b-a4b-it:free,openai/gpt-oss-120b:free')) {
         // Hard guard: only ":free" ids may ever be sent, so a typo cannot spend credits.
@@ -173,7 +178,7 @@ async function callCompat(env, entry, messages, temperature, tools, override) {
     const data = await res.json();
     const choice = data.choices?.[0] || {};
     const msg = choice.message || {};
-    if (data.usage) console.log(`[LLM] ${entry.provider}/${entry.model} tokens: prompt ${data.usage.prompt_tokens} + out ${data.usage.completion_tokens}`);
+    if (data.usage) console.log(`[LLM] ${entry.provider}/${entry.model} tokens: prompt ${data.usage.prompt_tokens} (cached ${data.usage.prompt_tokens_details?.cached_tokens ?? 0}) + out ${data.usage.completion_tokens}`);
     return { content: (msg.content || '').trim() || null, toolCalls: normaliseCalls(msg.tool_calls), finish: choice.finish_reason };
   } catch (err) {
     if (err.name === 'AbortError') throw new LlmError(`${entry.provider} timeout`, { status: 0 });
@@ -358,7 +363,7 @@ async function streamCompat(env, entry, messages, temperature, tools, onSentence
     const toolCalls = normaliseCalls(calls);
     if (!toolCalls && pending.trim()) { streamedAny = true; await onSentence(pending.trim(), true); }
     const content = full.trim() || null;
-    if (usage) console.log(`[LLM] ${entry.provider}/${entry.model} tokens: prompt ${usage.prompt_tokens} + out ${usage.completion_tokens}, first reply in ${Date.now() - started}ms total`);
+    if (usage) console.log(`[LLM] ${entry.provider}/${entry.model} tokens: prompt ${usage.prompt_tokens} (cached ${usage.prompt_tokens_details?.cached_tokens ?? usage.x_groq?.usage?.prompt_tokens_details?.cached_tokens ?? 0}) + out ${usage.completion_tokens}, ${Date.now() - started}ms total`);
     return { content, toolCalls, streamedAny };
   } catch (err) {
     if (err.name === 'AbortError') throw new LlmError(`${entry.provider} timeout`, { status: 0 });

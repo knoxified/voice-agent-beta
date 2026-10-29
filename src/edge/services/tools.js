@@ -225,7 +225,10 @@ function followUpInstruction(session, original) {
 
 async function runSetName(session, args) {
   const name = String(args.name || '').replace(/[^A-Za-z\u00C0-\u024F'’ .-]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80);
-  if (name.length < 2) return { ok: false, error: 'bad_name', instruction: 'Ask them to say or spell their name again, slowly.' };
+  // A name is a few words. Anything that reads like an instruction is not a name (prompt-injection guard).
+  if (name.length < 2 || name.split(' ').length > 5 || /\b(ignore|instruction|prompt|system|assistant|you are|act as|pretend|override|jailbreak)\b/i.test(name)) {
+    return { ok: false, error: 'bad_name', instruction: 'Ask them to say or spell their name again, slowly.' };
+  }
   session.confirmedName = name;
   session.callerName = name;
   const letters = name.replace(/[^A-Za-z]/g, '').split('').join(', ').toUpperCase();
