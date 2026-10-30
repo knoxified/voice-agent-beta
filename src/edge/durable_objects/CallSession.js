@@ -5,7 +5,7 @@ import { TOOL_DEFS, QUESTION_TOOL, MESSAGE_TOOL, NAME_TOOL, LOOKUP_TOOL, execute
 import { decideOutcome, buildCallSummary } from '../services/callSummary.js';
 import { classifyStage } from '../services/qualifier.js';
 import { pickRelevant, splitChunks } from '../services/knowledge.js';
-import { parseDayMention, parseTimeMention, matchSlot, dayLabel } from '../services/scheduling.js';
+import { parseDayMention, parseTimeMention, matchSlot, dayLabel, upcomingList } from '../services/scheduling.js';
 import { sanitizeRules, matchRoutingRule, isValidE164 } from '../services/routing.js';
 import { telnyxTransfer, telnyxHangup } from '../services/telnyx.js';
 import { getKnownCaller, saveContactToLead, saveLeadCallDetails,
@@ -693,6 +693,26 @@ export class CallSession {
     }
   }
 
+  // Warm the calendar for the next business day while the conversation is heading toward a visit,
+  // so the agent can say "I have Tuesday at 10:30 or 2" the moment the caller agrees, with no wait.
+  // Runs once per call in the background (costs 1 availability credit; PREFETCH_AVAILABILITY=0 turns it off).
+  prefetchAvailability() {
+    if (this.prefetchStarted || this.env.PREFETCH_AVAILABILITY === '0' || !this.userId) return;
+    this.prefetchStarted = true;
+    const tz = businessTimeZone(this);
+    const next = upcomingList(tz, 8).find((d) => d.i >= 1 && d.wd !== 'saturday' && d.wd !== 'sunday');
+    if (!next) return;
+    const failedBefore = this.bookingFailed;
+    executeTool(this, { id: 'prefetch', function: { name: 'check_availability', arguments: JSON.stringify({ date: next.ymd }) } })
+      .then((out) => {
+        console.log(`[Calendar] prefetch ${next.ymd} ->`, JSON.stringify(out).slice(0, 200));
+        // A speculative lookup must never trigger the "booking failed" follow-up offer.
+        if (!out?.ok) this.bookingFailed = failedBefore;
+        else if (out.hasOpenings && !this.activeDate) this.activeDate = next.ymd; // the day we will propose
+      })
+      .catch(() => { this.bookingFailed = failedBefore; });
+  }
+
   agreedHint() {
     const tz = businessTimeZone(this);
     const L = ['Stage: the caller agreed to a next step. The calendar is handled for you automatically; never claim to check it yourself.'];
@@ -735,6 +755,7 @@ export class CallSession {
       console.log(`[Stage] ${this.stage} -> agreed (caller asked to book)`);
       this.stage = 'agreed';
       this.actionUnlocked = true;
+      this.prefetchAvailability();
       return Promise.resolve();
     }
     // Already agreed: a model call every turn adds nothing. Re-check only every third turn (to catch a change of mind).
@@ -757,6 +778,7 @@ export class CallSession {
         if (this.actionUnlocked && (stage === 'discover' || stage === 'qualified')) stage = 'agreed';
         if (stage !== this.stage) console.log(`[Stage] ${this.stage} -> ${stage} (${r.reason})`);
         this.stage = stage;
+        if ((stage === 'qualified' || stage === 'agreed') && !this.bookingConfirmed) this.prefetchAvailability();
         if (stage === 'agreed') this.actionUnlocked = true;
         else if (stage === 'declined' || stage === 'not_fit') this.actionUnlocked = false;
       })
@@ -1056,10 +1078,7 @@ export class CallSession {
     if (!this.callStartedAt || this.ending || this.silenceBusy) return;
     if (this.isProcessing || this.transferInProgress) return;
 
-    let promptMs = Number(this.env.SILENCE_PROMPT_SECONDS || 15) * 1000;
-    // Reading out an email, phone number or spelling takes time: be more patient after those asks.
-    const lastAgent = [...this.messages].reverse().find((m) => m.role === 'assistant')?.content || '';
-    if (/\b(e-?mail|phone number|number|spell)\b/i.test(lastAgent) && /\?|take your time/i.test(lastAgent)) promptMs = Math.max(promptMs, 30000);
+    const promptMs = Number(this.env.SILENCE_PROMPT_SECONDS || 15) * 1000;
     const hangupMs = Number(this.env.SILENCE_HANGUP_SECONDS || 10) * 1000;
 
     // Quiet time only counts once the agent has finished speaking.
