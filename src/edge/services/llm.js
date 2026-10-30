@@ -94,7 +94,7 @@ function buildChain(env, background = false) {
       // Set GROQ_MODELS="a,b,c" to choose; a model your key cannot use is skipped for 6 hours.
       const groqModels = env.GROQ_MODELS
         ? list(env.GROQ_MODELS)
-        : [env.GROQ_MODEL || 'openai/gpt-oss-20b', 'openai/gpt-oss-120b', 'llama-3.1-8b-instant'];
+        : [env.GROQ_MODEL || 'openai/gpt-oss-20b', 'openai/gpt-oss-120b'];
       for (const model of [...new Set(groqModels)]) chain.push({ provider: 'groq', model });
     } else if (p === 'openrouter' && env.OPENROUTER_API_KEY) {
       for (const model of list(env.OPENROUTER_MODELS || 'openai/gpt-oss-20b:free,google/gemma-4-26b-a4b-it:free,openai/gpt-oss-120b:free')) {

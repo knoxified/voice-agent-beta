@@ -17,7 +17,7 @@ Also judge how the CALLER feels right now from their latest words (caller_mood);
 Stages:
 - discover: still learning what the caller needs, small talk, or the need is vague.
 - qualified: the caller described a specific, real need the business could help with AND shows they want to act on it (asks what to do, wants it looked at, asks about cost, timing or process). The agent has NOT yet proposed a concrete next step (visit, appointment, consultation, viewing, call-back).
-- agreed: the agent proposed a concrete next step AND the caller clearly accepted it.
+- agreed: the agent proposed a concrete next step AND the caller clearly accepted it, OR the caller themselves asked to come in / book or named the day or time they want (even if they turned down the agent's suggested slot).
 - declined: the caller turned the next step down, or only wants information.
 - not_fit: wrong number, spam, unrelated to the business, or abusive.
 

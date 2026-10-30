@@ -937,7 +937,7 @@ export class CallSession {
       } else if (this.stage === 'discover') {
         hints.push('Stage: still discovering. Do NOT suggest a visit, appointment, call-back or any next step yet. If they asked you a direct question, answer it first (or say plainly you do not have the answer). Then react to what they said and ask one specific follow-up about their situation (what exactly, how long, how bad, what they have already tried).');
       } else if (this.stage === 'qualified') {
-        hints.push(`Stage: the caller is a genuine fit. If you have not already, make ONE soft next-step suggestion now in your own words, the way a person in your role naturally would (what the business wants from a good call: ${cta}). Do not mention booking systems, calendars or tools, and do not ask for personal details yet. If they answer vaguely, keep helping instead of pushing.`);
+        hints.push(`Stage: the caller is a genuine fit. If you have not already, make ONE soft next-step suggestion now in your own words, the way a person in your role naturally would (what the business wants from a good call: ${cta}). Do not mention booking systems, calendars or tools, and do not ask for personal details yet. Never name a specific day or time yourself (you cannot see the calendar at this stage); if they ask when they can come, just ask which day suits them. If they answer vaguely, keep helping instead of pushing.`);
       } else if (this.stage === 'agreed') {
         hints.push(this.agreedHint());
       } else if (this.stage === 'declined') {
@@ -1056,7 +1056,10 @@ export class CallSession {
     if (!this.callStartedAt || this.ending || this.silenceBusy) return;
     if (this.isProcessing || this.transferInProgress) return;
 
-    const promptMs = Number(this.env.SILENCE_PROMPT_SECONDS || 15) * 1000;
+    let promptMs = Number(this.env.SILENCE_PROMPT_SECONDS || 15) * 1000;
+    // Reading out an email, phone number or spelling takes time: be more patient after those asks.
+    const lastAgent = [...this.messages].reverse().find((m) => m.role === 'assistant')?.content || '';
+    if (/\b(e-?mail|phone number|number|spell)\b/i.test(lastAgent) && /\?|take your time/i.test(lastAgent)) promptMs = Math.max(promptMs, 30000);
     const hangupMs = Number(this.env.SILENCE_HANGUP_SECONDS || 10) * 1000;
 
     // Quiet time only counts once the agent has finished speaking.
@@ -1457,7 +1460,7 @@ const CALLER_MOODS = [
 const LLM_MOOD_MAP = { upset: 'sympathetic', worried: 'sympathetic', in_pain: 'sympathetic', angry: 'calm', urgent: 'calm', confused: 'calm', excited: 'enthusiastic', happy: 'enthusiastic' };
 
 // Plain-language signals that the caller wants to book / asks about open times.
-const BOOKING_INTENT_RE = /\b(book|booking|schedule|appointment|reserve|set up (a|an) (time|visit|meeting|consultation)|which (day|days|time|times) (is|are|will|do|can|works?)|what (day|days) (is|are|will|can)|what (time|times) (are|is) (you|there|available|free)|any (day|days|slot|slots|openings?)|(have|got) (an? )?(openings?|slots?|spots?)|your availability|when (can|could|do) (i|we) (come|see|get|visit)|(can|could) i (come|see|get) (in|seen)|get it done|sign me up|let'?s book)\b/i;
+const BOOKING_INTENT_RE = /\b(book|booking|schedule|appointment|reserve|set up (a|an) (time|visit|meeting|consultation)|which (day|days|time|times) (is|are|will|would|do|does|can|could|should|works?)|what (day|days) (is|are|will|would|can|could|works?)|what (time|times) (are|is|would|could|works?) (you|there|available|free|best)?|when (are|would|will) you (be )?(open|available|free)|any (day|days|slot|slots|openings?)|(have|got) (an? )?(openings?|slots?|spots?)|your availability|when (can|could|do) (i|we) (come|see|get|visit)|(can|could) i (come|see|get) (in|seen)|get it done|sign me up|let'?s book)\b/i;
 
 const STILL_THERE_LINES = [
   'Hello? Are you still there?',
