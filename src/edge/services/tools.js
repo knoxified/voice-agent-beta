@@ -8,6 +8,7 @@ import { triggerAutomation } from './n8n.js';
 import { rangesLabels } from './scheduling.js';
 import { logPendingQuestion } from './supabase.js';
 import { pickRelevant } from './knowledge.js';
+import * as calcom from './calcom.js';
 
 const MAX_AVAILABILITY_CHECKS = 4; // per call (1 credit each)
 const MAX_BOOKINGS = 2; // per call (2 credits each)
@@ -129,6 +130,56 @@ export const TOOL_DEFS = [
   },
 ];
 
+// Which calendar this tenant's agent books into. 'google' = through the n8n workflow (default,
+// and always used for the public demo); 'calcom' = straight to Cal.com with the customer's API key.
+export function calendarProvider(session) {
+  if (session.isDemo) return 'google';
+  return String(session.agentConfig?.calendar_provider || 'google').toLowerCase();
+}
+
+// Only offered when the tenant's calendar is Cal.com (the n8n/Google workflow has no reschedule or cancel).
+export const MANAGE_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'reschedule_appointment',
+      description:
+        'Move the caller\'s EXISTING appointment to a new time. Call ONLY when the caller asked to reschedule, they chose a new time from the calendar results in your notes, and they gave and confirmed the name and email the appointment was booked under (read the email back in short pieces and get a yes). Never use book_appointment for this.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Name the appointment was booked under, as confirmed.' },
+          email: { type: 'string', description: 'Email the appointment was booked under, as confirmed.' },
+          new_date: { type: 'string', description: 'New day, YYYY-MM-DD, from the Upcoming days list.' },
+          new_time: { type: 'string', description: 'New start time, 24-hour HH:MM, one of the open times.' },
+          current_date: { type: 'string', description: 'Only if they have several upcoming appointments: the day of the one to move, YYYY-MM-DD.' },
+          details_confirmed: { type: 'boolean', description: 'true ONLY if you read the email back and the caller confirmed it.' },
+        },
+        required: ['name', 'email', 'new_date', 'new_time', 'details_confirmed'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'cancel_appointment',
+      description:
+        'Cancel the caller\'s EXISTING appointment. Call ONLY when the caller clearly asked to cancel (not just move it), and they gave and confirmed the name and email the appointment was booked under. Offer to reschedule instead once, gently, before cancelling.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Name the appointment was booked under, as confirmed.' },
+          email: { type: 'string', description: 'Email the appointment was booked under, as confirmed.' },
+          current_date: { type: 'string', description: 'Only if they have several upcoming appointments: the day of the one to cancel, YYYY-MM-DD.' },
+          reason: { type: 'string', description: 'Optional: why they are cancelling, in a few words, only if they said.' },
+          details_confirmed: { type: 'boolean', description: 'true ONLY if you read the email back and the caller confirmed it.' },
+        },
+        required: ['name', 'email', 'details_confirmed'],
+      },
+    },
+  },
+];
+
 function validTimeZone(tz) {
   if (!tz || typeof tz !== 'string') return false;
   try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return true; } catch { return false; }
@@ -220,8 +271,14 @@ export async function executeTool(session, call) {
   if (name === 'lookup_business_info') return runLookup(session, args);
   if (name === 'take_question') return runTakeQuestion(session, args);
   if (name === 'take_message') return runTakeMessage(session, args);
-  if (name === 'check_availability' || name === 'book_appointment') {
-    const result = name === 'check_availability' ? await runAvailability(session, args) : await runBooking(session, args);
+  if (name === 'check_availability' || name === 'book_appointment' || name === 'reschedule_appointment' || name === 'cancel_appointment') {
+    if ((name === 'reschedule_appointment' || name === 'cancel_appointment') && calendarProvider(session) !== 'calcom') {
+      return { ok: false, error: 'unknown_tool' };
+    }
+    const result = name === 'check_availability' ? await runAvailability(session, args)
+      : name === 'book_appointment' ? await runBooking(session, args)
+      : name === 'reschedule_appointment' ? await runReschedule(session, args)
+      : await runCancel(session, args);
     // The system could not do it (not the caller's mistake): offer the follow-up right away, the way a person would.
     if (result && result.ok === false && SYSTEM_FAILURES.has(result.error)) {
       session.bookingFailed = true;
@@ -368,6 +425,21 @@ async function runAvailability(session, args) {
   }
   session.availabilityChecks += 1;
 
+  const provider = calendarProvider(session);
+  if (provider !== 'google' && provider !== 'calcom') {
+    console.warn(`[Calendar] unsupported calendar_provider "${provider}"`);
+    return { ok: false, error: 'lookup_failed', instruction: 'You could not reach the calendar. Offer to take a message so the team can follow up.' };
+  }
+  if (provider === 'calcom') {
+    const dayStart = localToInstant(date, '00:00', tz).instant.toISOString();
+    const dayEnd = localToInstant(date, '23:59', tz).instant.toISOString();
+    const r = await calcom.fetchSlots(session, { date, tz, startIso: dayStart, endIso: dayEnd });
+    if (!r.ok) {
+      return { ok: false, error: 'lookup_failed', instruction: 'You could not reach the calendar. Offer to take a message so the team can follow up.' };
+    }
+    return finishAvailability(session, { date, tz, starts: r.starts });
+  }
+
   const duration = cleanDuration(args.duration_minutes);
   const res = await triggerAutomation(session.env, 'check_availability', {
     userId: session.userId,
@@ -385,11 +457,15 @@ async function runAvailability(session, args) {
     return { ok: false, error: 'lookup_failed', instruction: 'You could not reach the calendar. Offer to take a message so the team can follow up.' };
   }
 
-  // Build the spoken times ourselves from the real slot instants, in the
-  // business timezone. n8n's own text summary is not trusted for display.
   const starts = (Array.isArray(res.freeSlots) ? res.freeSlots : [])
     .map((sl) => Date.parse(sl.start))
     .filter(Number.isFinite);
+  return finishAvailability(session, { date, tz, starts });
+}
+
+// Build the spoken times ourselves from the real slot instants, in the business
+// timezone. Shared by every calendar provider; a provider's own text summary is never trusted.
+function finishAvailability(session, { date, tz, starts }) {
   session.availabilitySlots.set(date, new Set(starts));
   const labels = spreadLabels(starts, tz, 6);
   const summary = starts.length
@@ -497,6 +573,26 @@ async function runBooking(session, args) {
   }
 
   const reason = reasonText.slice(0, 100);
+
+  if (calendarProvider(session) === 'calcom') {
+    const r = await calcom.bookSlot(session, { startMs: instant.getTime(), name, email, phone, notes: reason, tz });
+    if (r.ok) {
+      session.bookingsMade += 1;
+      session.bookingConfirmed = { name, date, time };
+      session.capturedContact = { name, email };
+      session.lastBookingUid = r.uid;
+      return {
+        ok: true, booked: true, name, date, time, duration_minutes: r.durationMinutes,
+        ...(r.pending ? { instruction: 'The booking is waiting for the team to confirm it. Say the request is in and they will confirm by email, not that it is final.' } : {}),
+      };
+    }
+    if (r.error === 'slot_taken') {
+      session.availabilityCache.delete(date); // that day's list is stale now
+      return { ok: false, error: 'slot_taken', instruction: 'That time was just taken. Apologise briefly and offer another time (you may check availability again).' };
+    }
+    return { ok: false, error: 'booking_failed', instruction: 'The booking did not go through. Do not claim it did. Take their details and say the team will follow up.' };
+  }
+
   // provider is added here by code (the caller is never asked); the workflow
   // resolves the saved calendar connection from it. phone is sent only if known.
   const payload = {
@@ -538,6 +634,115 @@ async function runBooking(session, args) {
     return { ok: true, booked: true, name, date, time, duration_minutes: duration };
   }
   return { ok: false, error: 'booking_failed', instruction: 'The booking did not go through. Do not claim it did. Take their details and say the team will follow up.' };
+}
+
+// ---- change / cancel an existing appointment (Cal.com only) ------------------
+
+const MAX_MANAGE_LOOKUPS = 3; // per call
+
+function whenLabel(ms, tz) {
+  return new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' }).format(new Date(ms));
+}
+
+function localDay(ms, tz) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(ms));
+}
+
+// Loose first/last-name overlap: the person on the phone must give a name that matches the booking,
+// so knowing only an email address is not enough to change someone else's appointment.
+function nameMatches(a, b) {
+  const tokens = (x) => String(x || '').toLowerCase().split(/[^a-z]+/).filter((t) => t.length >= 2);
+  const other = new Set(tokens(b));
+  return tokens(a).some((t) => other.has(t));
+}
+
+async function resolveBooking(session, args, tz) {
+  const name = String(session.confirmedName || args.name || '').trim();
+  const email = String(args.email || '').trim().toLowerCase();
+  if (name.length < 2 || !EMAIL_RE.test(email)) {
+    return { fail: { ok: false, error: 'missing_details', instruction: 'Ask for the name and the email the appointment was booked under, read the email back in short pieces, get a yes, then try again.' } };
+  }
+  if (args.details_confirmed !== true) {
+    return { fail: { ok: false, error: 'details_not_confirmed', instruction: 'Do not continue yet. Read the email back in short pieces (before the at sign, at, the domain as one word), get a yes from the caller, then try again with details_confirmed true.' } };
+  }
+  if ((session.manageLookups || 0) >= MAX_MANAGE_LOOKUPS) {
+    return { fail: { ok: false, error: 'limit_reached', instruction: 'Do not look again. Offer to have the team follow up.' } };
+  }
+  session.manageLookups = (session.manageLookups || 0) + 1;
+
+  const found = await calcom.findBookings(session, { email });
+  if (!found.ok) {
+    return { fail: { ok: false, error: 'lookup_failed', instruction: 'You could not reach the calendar. Offer to take a message so the team can follow up.' } };
+  }
+  let list = found.bookings.filter((b) =>
+    b.attendees.some((a) => String(a.email || '').toLowerCase() === email && nameMatches(name, a.name))
+  );
+  const wantDay = String(args.current_date || '').trim();
+  if (isRealDate(wantDay)) {
+    const sameDay = list.filter((b) => localDay(b.startMs, tz) === wantDay);
+    if (sameDay.length) list = sameDay;
+  }
+  if (!list.length) {
+    return { fail: { ok: false, error: 'no_booking_found', instruction: 'You could not find an upcoming appointment under that name and email. Do not guess or hint at other details. Ask once whether it was booked under a different email; otherwise offer to take a message for the team.' } };
+  }
+  if (list.length > 1) {
+    return { fail: { ok: false, error: 'which_booking', options: list.map((b) => whenLabel(b.startMs, tz)), instruction: 'They have more than one upcoming appointment. Read these out and ask which one they mean, then call again with current_date set to that day (YYYY-MM-DD from the Upcoming days list).' } };
+  }
+  return { booking: list[0], name, email };
+}
+
+async function runReschedule(session, args) {
+  const tz = businessTimeZone(session);
+  if (session.selectedSlot) args = { ...args, new_date: session.selectedSlot.date, new_time: session.selectedSlot.time };
+  const newDate = String(args.new_date || '').trim();
+  const newTime = String(args.new_time || '').trim();
+  if (!isRealDate(newDate) || !TIME_RE.test(newTime)) {
+    return { ok: false, error: 'missing_details', instruction: 'Ask which new day and time they want, then offer real open times.' };
+  }
+  const { instant } = localToInstant(newDate, newTime, tz);
+  if (instant.getTime() < Date.now() + 5 * 60000) {
+    return { ok: false, error: 'time_in_past', instruction: 'That time has already passed. Ask for an upcoming time.' };
+  }
+  const open = session.availabilitySlots.get(newDate);
+  if (!open) return { ok: false, error: 'availability_not_checked', instruction: 'Ask which day they want, so the calendar for that day gets checked, then offer real open times.' };
+  if (!open.has(instant.getTime())) return { ok: false, error: 'time_not_open', instruction: 'That exact time is not open. Offer one of the open times from the availability result.' };
+
+  const res = await resolveBooking(session, args, tz);
+  if (res.fail) return res.fail;
+
+  const r = await calcom.rescheduleBooking(session, { uid: res.booking.uid, startMs: instant.getTime(), email: res.email });
+  if (r.ok) {
+    session.bookingConfirmed = { name: res.name, date: newDate, time: newTime };
+    session.capturedContact = { name: res.name, email: res.email };
+    return {
+      ok: true, rescheduled: true,
+      from: whenLabel(res.booking.startMs, tz), to: whenLabel(instant.getTime(), tz),
+      instruction: r.pending
+        ? 'The new time is waiting for the team to confirm. Say the change is requested and they will confirm by email.'
+        : 'Confirm the new time in one short sentence. They will get an updated confirmation by email.',
+    };
+  }
+  if (r.error === 'slot_taken') {
+    session.availabilityCache.delete(newDate);
+    return { ok: false, error: 'slot_taken', instruction: 'That time was just taken. Apologise briefly and offer another time.' };
+  }
+  return { ok: false, error: 'booking_failed', instruction: 'The change did not go through. Do not claim it did. Say the team will follow up to sort it out.' };
+}
+
+async function runCancel(session, args) {
+  const tz = businessTimeZone(session);
+  const res = await resolveBooking(session, args, tz);
+  if (res.fail) return res.fail;
+
+  const r = await calcom.cancelBooking(session, { uid: res.booking.uid, reason: String(args.reason || '').trim() });
+  if (r.ok) {
+    session.bookingCancelled = true;
+    return {
+      ok: true, cancelled: true, was: whenLabel(res.booking.startMs, tz),
+      instruction: 'Confirm the cancellation in one short sentence (they will get an email), and offer to book a new time whenever suits them.',
+    };
+  }
+  return { ok: false, error: 'booking_failed', instruction: 'The cancellation did not go through. Do not claim it did. Say the team will follow up to sort it out.' };
 }
 
 // Up to `max` evenly spread local clock labels ("10:00 AM") from slot starts.

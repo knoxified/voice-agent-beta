@@ -551,6 +551,7 @@ async function getAgentConfig(env, userId) {
     // Try the richest select first and drop only what is missing, so a missing
     // `timezone` column never costs the tenant their FAQs (or the other way round).
     const attempts = [
+      `${BASE_COLS}, website_summary, faqs, timezone, calendar_provider`,
       `${BASE_COLS}, website_summary, faqs, timezone`,
       `${BASE_COLS}, website_summary, faqs`,
       `${BASE_COLS}, timezone`,

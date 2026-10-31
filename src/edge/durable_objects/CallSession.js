@@ -1,7 +1,7 @@
 import { createLiveTranscription, sendAudio as sendToDeepgram, keepAlive } from '../services/stt.js';
 import { generateWithTools, streamWithTools } from '../services/llm.js';
 import { synthesizeSpeech, streamSpeech, EMOTIONS } from '../services/tts.js';
-import { TOOL_DEFS, QUESTION_TOOL, MESSAGE_TOOL, NAME_TOOL, LOOKUP_TOOL, executeTool, businessTimeZone } from '../services/tools.js';
+import { TOOL_DEFS, MANAGE_TOOLS, QUESTION_TOOL, MESSAGE_TOOL, NAME_TOOL, LOOKUP_TOOL, executeTool, businessTimeZone, calendarProvider } from '../services/tools.js';
 import { decideOutcome, buildCallSummary } from '../services/callSummary.js';
 import { classifyStage } from '../services/qualifier.js';
 import { pickRelevant, splitChunks } from '../services/knowledge.js';
@@ -82,6 +82,7 @@ export class CallSession {
     this.lastInterruptAt = 0;
     this.bookingsMade = 0;
     this.bookingConfirmed = null;
+    this.manageIntent = false; // caller wants to reschedule / cancel an existing appointment (Cal.com only)
     this.knownCaller = null;
     this.capturedContact = null;
     this.questionsLogged = 0;
@@ -534,7 +535,7 @@ export class CallSession {
 
       for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
         const lookup = (this.kbFaqs?.length || this.kbWebsite?.length || this.kbMemory?.length) ? [LOOKUP_TOOL] : [];
-          const toolList = round < MAX_TOOL_ROUNDS ? (this.actionUnlocked ? [...TOOL_DEFS, NAME_TOOL, ...lookup, QUESTION_TOOL, MESSAGE_TOOL] : [NAME_TOOL, ...lookup, QUESTION_TOOL, MESSAGE_TOOL]) : null;
+          const toolList = round < MAX_TOOL_ROUNDS ? (this.actionUnlocked ? [...TOOL_DEFS, ...(calendarProvider(this) === 'calcom' ? MANAGE_TOOLS : []), NAME_TOOL, ...lookup, QUESTION_TOOL, MESSAGE_TOOL] : [NAME_TOOL, ...lookup, QUESTION_TOOL, MESSAGE_TOOL]) : null;
 
         // Speak each sentence as the model writes it, so the first words reach
         // the caller while the rest is still being generated. If streaming
@@ -713,9 +714,29 @@ export class CallSession {
       .catch(() => { this.bookingFailed = failedBefore; });
   }
 
+  // Caller wants to change or cancel an EXISTING appointment (Cal.com tenants).
+  manageHint(L, tz) {
+    L.push('The caller wants to RESCHEDULE or CANCEL an appointment they already have. Never use book_appointment for this, and never claim a change is done until the tool says so.');
+    L.push('1) If it is unclear, ask once whether they want to move it or cancel it.');
+    L.push('2) Ask for the full name and the email the appointment was booked under and tell them to take the email slowly. Repeat the name back once; read the email back in short pieces (before the at sign, at, the domain as one word) and get a yes.');
+    L.push('3) CANCEL: offer once, gently, to move it instead. If they still want to cancel, use cancel_appointment with details_confirmed true.');
+    if (!this.activeDate) {
+      L.push('4) RESCHEDULE: ask which new day suits them. You have NO calendar information yet, so do not mention any times.');
+      return L.join('\n');
+    }
+    const dl = dayLabel(this.activeDate, tz);
+    const info = this.availabilityCache.get(this.activeDate);
+    if (!info) L.push(`4) RESCHEDULE: the calendar for ${dl} could not be checked right now. Do not offer times; offer to take a message so the team can follow up.`);
+    else if (!info.hasOpenings) L.push(`4) RESCHEDULE: there are no openings on ${dl}. Say so briefly and ask for another day.`);
+    else if (!this.selectedSlot) L.push(`4) RESCHEDULE: the calendar for ${dl} is ALREADY checked. Open start times: ${info.openRanges.join('; ')}. Offer two or three, naturally. Never name a time outside these ranges.${this.timeNotOpen ? ` They asked for ${this.timeNotOpen}, which is NOT open; say so and offer the nearest open times.` : ''}`);
+    else L.push(`4) RESCHEDULE: LOCKED IN new time: ${this.selectedSlot.label} on ${dl}. Once the name and email are confirmed, use reschedule_appointment (details_confirmed true). Say "one moment" first.`);
+    return L.join('\n');
+  }
+
   agreedHint() {
     const tz = businessTimeZone(this);
     const L = ['Stage: the caller agreed to a next step. The calendar is handled for you automatically; never claim to check it yourself.'];
+    if (this.manageIntent) return this.manageHint(L, tz);
     if (!this.activeDate) {
       L.push('1) Ask which day suits them. You have NO calendar information yet, so do not mention any times or openings.');
       return L.join('\n');
@@ -751,6 +772,16 @@ export class CallSession {
     // Fast path (no model call): when the caller plainly asks to book or asks which day/time is free,
     // they have already agreed. Skip qualifying and unlock the booking tools right now.
     const lastUser = [...this.messages].reverse().find((m) => m.role === 'user')?.content || '';
+    // Changing or cancelling an existing appointment (Cal.com tenants): unlock the calendar and the
+    // manage tools right away, and skip the speculative next-day lookup (not wanted for a cancellation).
+    if (!this.manageIntent && calendarProvider(this) === 'calcom' && MANAGE_INTENT_RE.test(lastUser)) {
+      console.log(`[Stage] ${this.stage} -> agreed (caller wants to change or cancel an existing appointment)`);
+      this.manageIntent = true;
+      this.prefetchStarted = true;
+      this.stage = 'agreed';
+      this.actionUnlocked = true;
+      return Promise.resolve();
+    }
     if (!this.actionUnlocked && !this.bookingConfirmed && BOOKING_INTENT_RE.test(lastUser) && !/\b(don'?t|do not|not)\s+(want|need)\s+to\s+book\b/i.test(lastUser)) {
       console.log(`[Stage] ${this.stage} -> agreed (caller asked to book)`);
       this.stage = 'agreed';
@@ -1479,6 +1510,9 @@ const CALLER_MOODS = [
 const LLM_MOOD_MAP = { upset: 'sympathetic', worried: 'sympathetic', in_pain: 'sympathetic', angry: 'calm', urgent: 'calm', confused: 'calm', excited: 'enthusiastic', happy: 'enthusiastic' };
 
 // Plain-language signals that the caller wants to book / asks about open times.
+// "cancel my appointment", "I need to reschedule", "can I move my booking to Friday"
+const MANAGE_INTENT_RE = /\b(re-?schedul\w*|postpone|cancel\w*|call off)\b|\b(move|change|push|shift)\b.{0,30}\b(appointment|booking|visit|consultation|slot)\b/i;
+
 const BOOKING_INTENT_RE = /\b(book|booking|schedule|appointment|reserve|set up (a|an) (time|visit|meeting|consultation)|which (day|days|time|times) (is|are|will|would|do|does|can|could|should|works?)|what (day|days) (is|are|will|would|can|could|works?)|what (time|times) (are|is|would|could|works?) (you|there|available|free|best)?|when (are|would|will) you (be )?(open|available|free)|any (day|days|slot|slots|openings?)|(have|got) (an? )?(openings?|slots?|spots?)|your availability|when (can|could|do) (i|we) (come|see|get|visit)|(can|could) i (come|see|get) (in|seen)|get it done|sign me up|let'?s book)\b/i;
 
 const STILL_THERE_LINES = [
