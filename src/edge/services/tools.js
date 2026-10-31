@@ -153,6 +153,7 @@ export const MANAGE_TOOLS = [
           new_date: { type: 'string', description: 'New day, YYYY-MM-DD, from the Upcoming days list.' },
           new_time: { type: 'string', description: 'New start time, 24-hour HH:MM, one of the open times.' },
           current_date: { type: 'string', description: 'Only if they have several upcoming appointments: the day of the one to move, YYYY-MM-DD.' },
+          current_time: { type: 'string', description: 'Only if two appointments are on the same day: the start time of the one to move, 24-hour HH:MM.' },
           details_confirmed: { type: 'boolean', description: 'true ONLY if you read the email back and the caller confirmed it.' },
         },
         required: ['name', 'email', 'new_date', 'new_time', 'details_confirmed'],
@@ -171,6 +172,7 @@ export const MANAGE_TOOLS = [
           name: { type: 'string', description: 'Name the appointment was booked under, as confirmed.' },
           email: { type: 'string', description: 'Email the appointment was booked under, as confirmed.' },
           current_date: { type: 'string', description: 'Only if they have several upcoming appointments: the day of the one to cancel, YYYY-MM-DD.' },
+          current_time: { type: 'string', description: 'Only if two appointments are on the same day: the start time of the one to cancel, 24-hour HH:MM.' },
           reason: { type: 'string', description: 'Optional: why they are cancelling, in a few words, only if they said.' },
           details_confirmed: { type: 'boolean', description: 'true ONLY if you read the email back and the caller confirmed it.' },
         },
@@ -682,11 +684,17 @@ async function resolveBooking(session, args, tz) {
     const sameDay = list.filter((b) => localDay(b.startMs, tz) === wantDay);
     if (sameDay.length) list = sameDay;
   }
+  const wantTime = String(args.current_time || '').trim();
+  if (list.length > 1 && TIME_RE.test(wantTime)) {
+    const clock = (ms) => new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date(ms));
+    const sameTime = list.filter((b) => clock(b.startMs) === wantTime);
+    if (sameTime.length) list = sameTime;
+  }
   if (!list.length) {
     return { fail: { ok: false, error: 'no_booking_found', instruction: 'You could not find an upcoming appointment under that name and email. Do not guess or hint at other details. Ask once whether it was booked under a different email; otherwise offer to take a message for the team.' } };
   }
   if (list.length > 1) {
-    return { fail: { ok: false, error: 'which_booking', options: list.map((b) => whenLabel(b.startMs, tz)), instruction: 'They have more than one upcoming appointment. Read these out and ask which one they mean, then call again with current_date set to that day (YYYY-MM-DD from the Upcoming days list).' } };
+    return { fail: { ok: false, error: 'which_booking', options: list.map((b) => whenLabel(b.startMs, tz)), instruction: 'They have more than one upcoming appointment. Read these out and ask which one they mean, then call again with current_date set to that day (YYYY-MM-DD from the Upcoming days list) and, if two are on the same day, current_time as 24-hour HH:MM.' } };
   }
   return { booking: list[0], name, email };
 }
