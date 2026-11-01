@@ -321,18 +321,100 @@ async function runLookup(session, args) {
   return { ok: true, found: true, notes: found.join('\n---\n'), instruction: 'Answer from these notes in your own words, briefly. Do not go beyond them and do not read them out.' };
 }
 
+// Speech-to-text hears a spelled name as separate letters ("F a v o u r", "k n o x") and often
+// drops or swaps one. Join runs of single letters into the word they spell, so a 6-letter name
+// is one word, not six (it used to be rejected for having "too many words").
+function collapseSpelling(raw) {
+  const tokens = String(raw || '').split(/[\s,.\-_/]+/).filter(Boolean);
+  const words = [];
+  let run = [];
+  const flush = () => { if (run.length) { words.push(run.join('')); run = []; } };
+  for (const t of tokens) {
+    if (/^[A-Za-z]$/.test(t)) run.push(t);
+    else { flush(); words.push(t); }
+  }
+  flush();
+  // A lone "A" or "I" next to real words is a word, not a spelling: only trust runs of 2+ letters.
+  return words.map((w) => (w.length > 1 ? w[0].toUpperCase() + w.slice(1).toLowerCase() : w.toUpperCase()));
+}
+
+// Common names with a British/American form (or a letter speech-to-text keeps dropping).
+// We pick the likelier form and ask the caller ONE yes/no question about the differing letter.
+const NAME_VARIANTS = {
+  favur: ['Favour', 'Favor'], favor: ['Favour', 'Favor'], favour: ['Favour', 'Favor'],
+  honor: ['Honour', 'Honor'], honour: ['Honour', 'Honor'],
+  savior: ['Saviour', 'Savior'], saviour: ['Saviour', 'Savior'],
+};
+
+// Which letters of the new attempt already agree with the previous one (same position), so the
+// agent only re-asks about the part that changed instead of starting over.
+function compareSpellings(prev, next) {
+  const a = prev.toLowerCase().replace(/[^a-z]/g, '');
+  const b = next.toLowerCase().replace(/[^a-z]/g, '');
+  let pre = 0;
+  while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre++;
+  let suf = 0;
+  while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf]) suf++;
+  const up = (x) => x.split('').join(', ').toUpperCase();
+  return {
+    same: a === b,
+    kept: [a.slice(0, pre), b.slice(b.length - suf)].filter(Boolean).map(up),
+    changed: up(b.slice(pre, b.length - suf)),
+    before: up(a.slice(pre, a.length - suf)),
+  };
+}
+
 async function runSetName(session, args) {
-  const name = String(args.name || '').replace(/[^A-Za-z\u00C0-\u024F'’ .-]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80);
+  const cleaned = String(args.name || '').replace(/[^A-Za-z\u00C0-\u024F'’ .,-]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+  const name = collapseSpelling(cleaned).join(' ').slice(0, 80);
   // A name is a few words. Anything that reads like an instruction is not a name (prompt-injection guard).
   if (name.length < 2 || name.split(' ').length > 5 || /\b(ignore|instruction|prompt|system|assistant|you are|act as|pretend|override|jailbreak)\b/i.test(name)) {
-    return { ok: false, error: 'bad_name', instruction: 'Ask them to say or spell their name again, slowly.' };
+    session.nameFailures = (session.nameFailures || 0) + 1;
+    return {
+      ok: false,
+      error: 'bad_name',
+      instruction: session.nameFailures >= 2
+        ? 'Stay warm and patient, never sound frustrated. Say you did not catch it and ask them to give each letter with a word, like "F as in Frank", one at a time. Then call set_caller_name again.'
+        : 'Ask them to say or spell their name again, slowly.',
+    };
   }
-  session.confirmedName = name;
-  session.callerName = name;
-  const letters = name.replace(/[^A-Za-z]/g, '').split('').join(', ').toUpperCase();
+  session.nameFailures = 0;
+  const prev = session.nameAttempts?.length ? session.nameAttempts[session.nameAttempts.length - 1] : null;
+
+  // Pick the likelier spelling for names that have two common forms, and say so.
+  let chosen = name;
+  let variantNote = '';
+  const words = name.split(' ');
+  for (let i = 0; i < words.length; i++) {
+    const v = NAME_VARIANTS[words[i].toLowerCase()];
+    if (v && !session.nameVariantAsked?.[words[i].toLowerCase()]) {
+      session.nameVariantAsked = { ...(session.nameVariantAsked || {}), [words[i].toLowerCase()]: true };
+      words[i] = v[0];
+      chosen = words.join(' ');
+      variantNote = ` This name is commonly spelled two ways: ${v[0].split('').join(', ').toUpperCase()} (with a U) or ${v[1].split('').join(', ').toUpperCase()}. Spell back the first one and ask only: "with a U, or without?" Use whichever they say.`;
+      break;
+    }
+  }
+
+  session.nameAttempts = [...(session.nameAttempts || []), chosen].slice(-6);
+  session.confirmedName = chosen;
+  session.callerName = chosen;
+  const letters = chosen.replace(/[^A-Za-z]/g, '').split('').join(', ').toUpperCase();
+
+  let diff = '';
+  if (prev && prev.toLowerCase() !== chosen.toLowerCase()) {
+    const d = compareSpellings(prev, chosen);
+    if (!d.same) {
+      diff = ` They are correcting an earlier spelling (${prev}). ${d.kept.length ? `These letters already matched, so do not re-ask them: ${d.kept.join(' ... ')}. ` : ''}Only check the part that changed${d.changed ? ` (${d.changed})` : ''}.`;
+    }
+  }
+  const patience = session.nameAttempts.length >= 3
+    ? ' This is the third try or more: be extra patient, say it is no trouble, and if it is still unclear ask for the letters with a word each ("F as in Frank").'
+    : '';
+
   return {
     ok: true,
-    instruction: `Name saved as "${name}". Read it back once, letter by letter for the part that was unclear (${letters}), and ask if that is right. If they say yes, carry on and use this name for everything. If not, ask them to spell it slowly and call set_caller_name again. Never keep using an old spelling after they corrected it.`,
+    instruction: `Name saved as "${chosen}". Read it back once, letter by letter (${letters}), and ask if that is right.${variantNote}${diff} If they say yes, carry on and use this name for everything. If not, listen for which letters are wrong, keep the ones that were right, and call set_caller_name again with the full corrected spelling. Never keep using an old spelling after they corrected it.${patience}`,
   };
 }
 

@@ -62,19 +62,24 @@ function parseRetryAfterMs(text, headers) {
 }
 
 // Decide how long to skip a provider after a failure.
+// Fallbacks exist so a call never breaks, not to carry it: the primary models are
+// retried as soon as their limit window has passed, so cool-downs are kept short.
 function coolDown(key, err) {
   const msg = String(err?.message || '');
   let until;
   if (err?.status === 429) {
     const daily = /per[ -]?day|daily|\bTPD\b|\bRPD\b|PerDay/i.test(msg);
-    until = daily ? nextUtcMidnight() : Date.now() + Math.min(Math.max(err.retryAfterMs || 20000, 5000), 90000);
+    // Per-minute limits: wait exactly what the provider said (plus a hair), not longer.
+    until = daily ? nextUtcMidnight() : Date.now() + Math.min(Math.max((err.retryAfterMs || 8000) + 300, 1500), 60000);
   } else if (err?.status === 401 || err?.status === 403) {
     until = Date.now() + 10 * 60000; // bad / blocked key: do not hammer it
     console.error(`[LLM] ${key} rejected our key (HTTP ${err.status}). Check the secret.`);
   } else if (err?.status === 404 || /model_not_found|no such model|does not exist|decommission|deprecated/i.test(msg)) {
     until = Date.now() + 6 * 3600000; // model gone: stop asking
+  } else if (/tool_use_failed|tool call validation|failed to call a function|failed_generation/i.test(msg)) {
+    until = Date.now() + 1000; // one badly formed tool call is not an outage: fall through for this turn only
   } else {
-    until = Date.now() + 15000; // 5xx, timeout, network
+    until = Date.now() + 5000; // 5xx, timeout, network: a short breather, then try the primary again
   }
   coolUntil.set(key, until);
   console.warn(`[LLM] ${key} unavailable for ${Math.round((until - Date.now()) / 1000)}s (${err?.status || 'err'}: ${msg.slice(0, 140)})`);
@@ -94,7 +99,7 @@ function buildChain(env, background = false) {
       // Set GROQ_MODELS="a,b,c" to choose; a model your key cannot use is skipped for 6 hours.
       const groqModels = env.GROQ_MODELS
         ? list(env.GROQ_MODELS)
-        : [env.GROQ_MODEL || 'openai/gpt-oss-20b', 'openai/gpt-oss-120b', 'llama-3.3-70b-versatile'];
+        : [env.GROQ_MODEL || 'openai/gpt-oss-20b', 'openai/gpt-oss-120b'];
       for (const model of [...new Set(groqModels)]) chain.push({ provider: 'groq', model });
     } else if (p === 'openrouter' && env.OPENROUTER_API_KEY) {
       for (const model of list(env.OPENROUTER_MODELS || 'openai/gpt-oss-20b:free,google/gemma-4-26b-a4b-it:free,openai/gpt-oss-120b:free')) {
@@ -168,6 +173,31 @@ function normaliseCalls(calls) {
   }));
   return out.length ? out : null;
 }
+
+
+// Some models (Cloudflare gpt-oss especially) print a tool call's arguments as plain text,
+// e.g. {"name":"F A V U R","spelled_out":true}. Spoken aloud that is nonsense, so turn it
+// back into the tool call it was meant to be. Returns null if the text is not that.
+function rescueJsonToolCall(content, tools) {
+  const t = String(content || '').trim();
+  if (!t || t[0] !== '{' || !tools?.length) return null;
+  let obj;
+  try { obj = JSON.parse(t); } catch { return null; }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
+  const keys = Object.keys(obj);
+  if (!keys.length) return null;
+  for (const tool of tools) {
+    const props = Object.keys(tool.function?.parameters?.properties || {});
+    const req = tool.function?.parameters?.required || [];
+    if (keys.every((k) => props.includes(k)) && req.every((k) => k in obj)) {
+      return normaliseCalls([{ id: `call_${Date.now()}_r`, function: { name: tool.function.name, arguments: obj } }]);
+    }
+  }
+  return null;
+}
+
+// Never speak something that is clearly machine output.
+const looksLikeJson = (t) => /^\s*[\[{]/.test(String(t || '')) && /[:"]/.test(String(t || ''));
 
 // ── One-shot call to an OpenAI-compatible provider ───────────────────────────
 async function callCompat(env, entry, messages, temperature, tools, override) {
@@ -259,6 +289,8 @@ async function streamCloudflare(env, entry, messages, temperature, tools, onSent
   // Some models ignore stream:true and answer in one object.
   if (!out || typeof out.getReader !== 'function') {
     const r = parseCfResult(out);
+    const rescued = !r.toolCalls ? rescueJsonToolCall(r.content, tools) : null;
+    if (rescued) return { content: null, toolCalls: rescued, streamedAny: false };
     if (!r.content && !r.toolCalls) throw new LlmError('cf empty reply');
     return { content: r.content, toolCalls: r.toolCalls, streamedAny: false };
   }
@@ -363,9 +395,14 @@ async function streamCloudflare(env, entry, messages, temperature, tools, onSent
     clearTimeout(overall);
   }
 
-  const toolCalls = normaliseCalls(calls);
+  let toolCalls = normaliseCalls(calls);
+  if (!toolCalls) {
+    const rescued = rescueJsonToolCall(full, tools);
+    if (rescued) { toolCalls = rescued; pending = ''; console.warn('[LLM] cf printed a tool call as text, recovered it'); }
+    else if (looksLikeJson(full)) { pending = ''; full = ''; console.warn('[LLM] cf printed JSON as text, not speaking it'); }
+  }
   if (!toolCalls && pending.trim()) { streamedAny = true; await onSentence(pending.trim(), true); }
-  const content = full.trim() || null;
+  const content = (toolCalls ? '' : full.trim()) || null;
 
   if (!content && !toolCalls) {
     if (streamedAny) throw new LlmError('cf stream ended empty');
@@ -391,6 +428,10 @@ async function runChainOnce(env, messages, temperature, tools, override, backgro
       const r = entry.provider === 'cf'
         ? await callCloudflare(env, entry, messages, temperature, tools, override)
         : await callCompat(env, entry, messages, temperature, tools, override);
+      if (!r.toolCalls) {
+        const rescued = rescueJsonToolCall(r.content, tools);
+        if (rescued) { r.toolCalls = rescued; r.content = null; }
+      }
       if (!r.content && !r.toolCalls) { failures.push(`${key}: empty`); continue; }
       console.log(`[LLM] answered by ${key}`);
       return r;
@@ -506,9 +547,14 @@ async function streamCompat(env, entry, messages, temperature, tools, onSentence
       }
     }
 
-    const toolCalls = normaliseCalls(calls);
+    let toolCalls = normaliseCalls(calls);
+    if (!toolCalls) {
+      const rescued = rescueJsonToolCall(full, tools);
+      if (rescued) { toolCalls = rescued; pending = ''; console.warn(`[LLM] ${entry.provider} printed a tool call as text, recovered it`); }
+      else if (looksLikeJson(full)) { pending = ''; full = ''; }
+    }
     if (!toolCalls && pending.trim()) { streamedAny = true; await onSentence(pending.trim(), true); }
-    const content = full.trim() || null;
+    const content = (toolCalls ? '' : full.trim()) || null;
     if (usage) console.log(`[LLM] ${entry.provider}/${entry.model} tokens: prompt ${usage.prompt_tokens} (cached ${usage.prompt_tokens_details?.cached_tokens ?? usage.x_groq?.usage?.prompt_tokens_details?.cached_tokens ?? 0}) + out ${usage.completion_tokens}, ${Date.now() - started}ms total`);
     return { content, toolCalls, streamedAny };
   } catch (err) {
