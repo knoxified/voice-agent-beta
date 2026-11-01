@@ -95,6 +95,9 @@ async function createLiveTranscription(env, onTranscript, onError, onActivity, o
   };
   let pending = '';
   let timer = null;
+  // While the agent is collecting an email the caller may pause between letters, so the
+  // session can ask the stream to wait longer before handing the words over.
+  const hold = () => Number(opts.getHoldMs ? opts.getHoldMs(pending) : 0) || 0;
 
   const flush = () => {
     if (timer) {
@@ -134,12 +137,18 @@ async function createLiveTranscription(env, onTranscript, onError, onActivity, o
         console.log(`[STT] Segment: "${transcript}"`);
       }
       if (data.speech_final && pending) {
-        timer = setTimeout(flush, isComplete(pending) ? debounceMs : incompleteMs);
+        timer = setTimeout(flush, Math.max(isComplete(pending) ? debounceMs : incompleteMs, hold()));
       }
     } else if (data.type === 'UtteranceEnd') {
       // ~1s of silence: deliver whatever has been finalized.
       if (pending.trim().length > 0) {
-        if (isComplete(pending)) {
+        const h = hold();
+        if (h > 0) {
+          // Email capture: about 1s of silence has passed already, wait out the rest.
+          if (timer) clearTimeout(timer);
+          console.log(`[STT] UtteranceEnd, holding ${Math.max(300, h - 1000)}ms for the email`);
+          timer = setTimeout(flush, Math.max(300, h - 1000));
+        } else if (isComplete(pending)) {
           console.log('[STT] UtteranceEnd flush');
           flush();
         } else if (!timer) {

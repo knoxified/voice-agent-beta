@@ -7,6 +7,7 @@
 import { triggerAutomation } from './n8n.js';
 import { rangesLabels } from './scheduling.js';
 import { logPendingQuestion } from './supabase.js';
+import { stripInvisible, editDistance } from './emailCapture.js';
 import { pickRelevant } from './knowledge.js';
 import * as calcom from './calcom.js';
 
@@ -267,6 +268,17 @@ export async function executeTool(session, call) {
     args = JSON.parse(call.function?.arguments || '{}');
   } catch {
     return { ok: false, error: 'bad_arguments', instruction: 'Ask the caller to repeat the details, then try again.' };
+  }
+
+  // Models sometimes slip invisible characters into addresses; strip them from every text argument.
+  for (const k of Object.keys(args)) if (typeof args[k] === 'string') args[k] = stripInvisible(args[k]);
+  // The code-assembled, caller-confirmed address wins over a model that mis-copied a letter.
+  for (const k of ['email', 'callback_email']) {
+    const given = String(args[k] || '').trim().toLowerCase();
+    if (given && session.confirmedEmail && given !== session.confirmedEmail && editDistance(given, session.confirmedEmail) <= 5) {
+      console.warn(`[Email] tool ${name} had ${given}; using the confirmed ${session.confirmedEmail}`);
+      args[k] = session.confirmedEmail;
+    }
   }
 
   if (name === 'set_caller_name') return runSetName(session, args);
