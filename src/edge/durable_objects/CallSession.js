@@ -23,8 +23,8 @@ import { getKnownCaller, saveContactToLead, saveLeadCallDetails,
   recordInboundLead,
 } from '../services/supabase.js';
 import { buildGreeting } from '../services/greeting.js';
-import { parseSpokenEmail, isEmailPrompt, yesNo, spokenReadback, domainResolves, findEmailInText, asksForEmailAgain, asksRepeat, EMAIL_PATTERN } from '../services/emailCapture.js';
-import { newDraft, draftEmail, applyCorrection, mergeRestatement } from '../services/emailFix.js';
+import { parseSpokenEmail, isEmailPrompt, yesNo, spokenReadback, spellChars, spokenDomain, parseDomainOnly, domainResolves, findEmailInText, asksForEmailAgain, asksRepeat, EMAIL_PATTERN } from '../services/emailCapture.js';
+import { newDraft, draftEmail, applyCorrection, mergeRestatement, segmentLocal, rangeText, rangeLocked, lockRange, unlockAll, setRangeFromSpeech } from '../services/emailFix.js';
 
 export class CallSession {
   constructor(state, env) {
@@ -667,6 +667,94 @@ export class CallSession {
     return p.complete ? 1400 : 3200;
   }
 
+  // Ask about the address one piece at a time. Returns true when this turn was handled.
+  async emailGuide(ec, draft, transcript, readBack) {
+    const g = ec.guide;
+    const yn = yesNo(transcript);
+    const save = (guide) => { this.emailCap = { ...this.emailCap, draft, guide }; };
+
+    // Next question: the first piece nobody has confirmed yet, then the part after the at sign, then the whole thing.
+    let walk = !!g.walk; // only go piece by piece when the caller could not say where the mistake is
+    const next = async (lead = '') => {
+      if (!walk) return readBack(lead || 'Got it.');
+      const piece = segmentLocal(draft).find((r) => !rangeLocked(draft, r));
+      if (piece) {
+        save({ stage: 'chunk', range: piece, walk: true });
+        await this.emailSay(`${lead} Is ${spellChars(rangeText(draft, piece))} right?`.trim());
+      } else if (!draft.domainLocked) {
+        save({ stage: 'domain', walk: true });
+        await this.emailSay(`${lead} And the part after the at sign, ${spokenDomain(draft.domain)}, is that right?`.trim());
+      } else {
+        await readBack(lead || 'Thank you.');
+      }
+      return true;
+    };
+
+    if (g.stage === 'where') {
+      const t = transcript.toLowerCase();
+      if (/\b(after the at|at sign|domain|gmail|yahoo|outlook|ending|dot com|\.com|website)\b/.test(t) && !/\b(before)\b/.test(t)) {
+        save({ stage: 'domainfix' });
+        await this.emailSay("Okay. Spell just the part after the at sign for me, slowly.");
+        return true;
+      }
+      if (/\b(numbers?|digits?|figures?)\b/.test(t)) {
+        const digitPiece = [...segmentLocal(draft)].reverse().find((r) => /^\d+/.test(rangeText(draft, r)));
+        if (digitPiece) {
+          save({ stage: 'fix', range: digitPiece, walk: false });
+          await this.emailSay("Okay. Say just the numbers for me, one at a time.");
+          return true;
+        }
+      }
+      if (/\b(dots?|periods?)\b/.test(t)) {
+        this.emailCap = { ...this.emailCap, draft, guide: null };
+        await this.emailSay("Should I add a dot or take one out? Tell me where, like a dot after the first name, or no dots at all.");
+        return true;
+      }
+      // first part, name, beginning, or "I don't know": go through it piece by piece
+      walk = true;
+      return next("Okay, let's go through it together.");
+    }
+
+    if (g.stage === 'chunk') {
+      if (yn === 'yes') { lockRange(draft, g.range); return next(); }
+      if (yn === 'no' || /\b(not sure|don'?t know|wrong)\b/i.test(transcript)) {
+        if (setRangeFromSpeech(draft, g.range, transcript)) { // "no, it's n o x f": they gave the fix in the same breath
+          const after = segmentLocal(draft).find((r) => r.s === g.range.s);
+          if (after) lockRange(draft, after);
+          return next('Got it.');
+        }
+        save({ stage: 'fix', range: g.range, walk: true });
+        await this.emailSay("What should that part be? Spell it for me, one letter at a time.");
+        return true;
+      }
+      return false; // not an answer to this question: let the normal fixes handle it
+    }
+
+    if (g.stage === 'fix') {
+      if (setRangeFromSpeech(draft, g.range, transcript)) {
+        const after = segmentLocal(draft).find((r) => r.s === g.range.s);
+        if (after) lockRange(draft, after);
+        return next('Got it.');
+      }
+      await this.emailSay("Sorry, could you say that part again, one letter at a time?");
+      return true;
+    }
+
+    if (g.stage === 'domain') {
+      if (yn === 'yes') { draft.domainLocked = true; return next(); }
+      if (yn === 'no') { save({ stage: 'domainfix', walk: true }); await this.emailSay("Okay. Spell just the part after the at sign for me, slowly."); return true; }
+      return false;
+    }
+
+    if (g.stage === 'domainfix') {
+      const dom = parseDomainOnly(transcript);
+      if (dom && (await domainResolves(dom))) { draft.domain = dom; draft.domainLocked = true; return next('Got it.'); }
+      await this.emailSay("I couldn't catch that one. Could you say it again, like gmail dot com, or spell it letter by letter?");
+      return true;
+    }
+    return false;
+  }
+
   sendToBrowser(obj) {
     try {
       if (this.provider === 'browser' && this.ws?.readyState === 1) this.ws.send(JSON.stringify(obj));
@@ -700,19 +788,25 @@ export class CallSession {
     // The caller is answering our read-back. Corrections edit a DRAFT of the address: parts they
     // confirm are locked, parts they fix change, nothing else moves (see services/emailFix.js).
     if (ec.pending) {
-      const yn = yesNo(transcript);
-      if (yn === 'yes') { this.confirmEmail(ec.pending); return false; } // model carries on, told the address is confirmed
-
       const draft = ec.draft || newDraft(ec.pending);
       const readBack = async (lead) => {
         const email = draftEmail(draft);
-        this.emailCap = { ...this.emailCap, active: false, pending: email, draft, noCount: 0 };
+        this.emailCap = { ...this.emailCap, active: false, pending: email, draft, noCount: 0, guide: null };
         this.sendToBrowser({ event: 'email_confirm', email });
         await this.emailSay(`${lead} ${spokenReadback(email)}. Is that right?`);
         return true;
       };
 
       if (asksRepeat(transcript)) return readBack('Sure.');
+
+      // Guided repair: the agent asks the questions, so the caller never has to guess what "yes" covers.
+      if (ec.guide) {
+        const done = await this.emailGuide(ec, draft, transcript, readBack);
+        if (done) return true;
+      }
+
+      const yn = yesNo(transcript);
+      if (yn === 'yes') { this.confirmEmail(ec.pending); return false; } // model carries on, told the address is confirmed
 
       // They said the whole address again: merge it, without letting noise undo what is already confirmed.
       const inline = findEmailInText(transcript);
@@ -736,14 +830,16 @@ export class CallSession {
       }
 
       if (yn === 'no') {
-        const noCount = (ec.noCount || 0) + 1;
-        if (noCount >= 2) {
+        const rounds = (ec.rounds || 0) + 1;
+        if (rounds >= 3) {
           this.emailCap = { active: true, buf: '', pending: null, draft: null, tries: ec.tries + 1, partialTurns: 0 };
           await this.emailSay("No problem, let's start fresh. Spell the part before the at sign, one letter at a time.");
           return true;
         }
-        this.emailCap = { ...ec, draft, noCount };
-        await this.emailSay("Which part should I change? Tell me what is right, like knox is right, and then the part to fix.");
+        // Second time round, nothing is trusted any more: a lock may have been wrong.
+        if (rounds >= 2) unlockAll(draft);
+        this.emailCap = { ...ec, draft, rounds, guide: { stage: 'where' } };
+        await this.emailSay("I'm sorry about that. Where did I miss it? Is it the first part, the part after the at sign, a dot, or the numbers?");
         return true;
       }
       // Neither a yes, a no nor a fix: treat it as a fresh attempt below.

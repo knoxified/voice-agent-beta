@@ -256,7 +256,7 @@ export function yesNo(text) {
 
 const SAY = { '.': 'dot', '-': 'dash', '_': 'underscore', '+': 'plus' };
 
-function spellChars(s) {
+export function spellChars(s) {
   return s.split('').map((c) => SAY[c] || c.toUpperCase()).join(', ');
 }
 
@@ -273,6 +273,24 @@ export function spokenReadback(email) {
     dom = `${spellChars(parts.join('.'))}, dot ${tld}`;
   }
   return `${spellChars(local)}, at, ${dom}`;
+}
+
+/** "gmail dot com" for common providers, letter by letter for anything else. */
+export function spokenDomain(domain) {
+  const d = String(domain || '');
+  if (COMMON_DOMAINS.has(d)) return d.replace(/\./g, ' dot ');
+  const parts = d.split('.');
+  const tld = parts.pop();
+  return `${spellChars(parts.join('.'))}, dot ${tld}`;
+}
+
+/** The caller said just the part after the at sign: "gmail dot com", "k n o x i f i e d dot org". */
+export function parseDomainOnly(text) {
+  const t = String(text || '');
+  const inline = findEmailInText(t.includes('@') ? t : `x@${t.replace(/\s+/g, '')}`);
+  if (inline && t.includes('@')) return inline.split('@')[1];
+  const p = parseSpokenEmail(`x at ${t}`);
+  return p.complete ? p.domain : '';
 }
 
 // ---- checks --------------------------------------------------------------------

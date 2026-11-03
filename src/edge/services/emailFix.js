@@ -247,3 +247,40 @@ export function mergeRestatement(draft, email, { deliberate = false } = {}) {
   if (conflict) { draft.conflicts += 1; draft.insisted = newLocal; } else { draft.conflicts = 0; draft.insisted = null; }
   return { changed: before !== draftEmail(draft), conflict };
 }
+
+
+// ---- walking through the address in small pieces ------------------------------------
+
+/** Split the name part into pieces a caller can say yes/no to: letter runs (max 5), digit runs, dots stay with the piece before. */
+export function segmentLocal(draft) {
+  const local = draftLocal(draft);
+  const raw = [];
+  const re = /[a-z]+|\d+|[^a-z\d]+/gi;
+  let m;
+  while ((m = re.exec(local))) {
+    const s = m.index, t = m[0];
+    if (/^[a-z]+$/i.test(t) && t.length > 5) {
+      const n = Math.ceil(t.length / 5), size = Math.ceil(t.length / n);
+      for (let i = 0; i < t.length; i += size) raw.push({ s: s + i, e: s + Math.min(t.length, i + size) });
+    } else raw.push({ s, e: s + t.length });
+  }
+  const out = [];
+  for (const r of raw) {
+    if (/^[^a-z\d]+$/i.test(local.slice(r.s, r.e)) && out.length) out[out.length - 1].e = r.e;
+    else out.push({ ...r });
+  }
+  return out;
+}
+export const rangeText = (d, r) => d.local.slice(r.s, r.e).map((x) => x.c).join('');
+export const rangeLocked = (d, r) => d.local.slice(r.s, r.e).every((x) => x.l);
+export function lockRange(d, r) { for (let i = r.s; i < r.e; i++) d.local[i].l = true; }
+export function unlockAll(d) { d.local.forEach((x) => { x.l = false; }); d.domainLocked = false; d.target = null; }
+
+/** The caller spelled the replacement for one piece ("it's n o x f", "two zero two"). */
+export function setRangeFromSpeech(d, r, utterance) {
+  const ch = chunksOf(utterance).filter((c) => !c.neg);
+  const pick = ch.find((c) => c.spelled) || ch.find((c) => /^\d+$/.test(c.text)) || ch.find((c) => c.text.length >= 2);
+  if (!pick) return false;
+  replaceRange(d, r.s, r.e, pick.text, true);
+  return true;
+}
