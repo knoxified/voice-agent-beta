@@ -9,10 +9,49 @@
 
 const ZW = /[\u200B-\u200D\u2060\uFEFF]/g;
 
-const NUMBER_WORDS = {
-  zero: '0', one: '1', two: '2', three: '3', four: '4', five: '5',
-  six: '6', seven: '7', eight: '8', nine: '9',
-};
+const UNITS = { zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9 };
+const TEENS = { ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19 };
+const TENS = { twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90 };
+export const isNumWord = (w) => w in UNITS || w in TEENS || w in TENS || w === 'hundred' || w === 'thousand';
+
+/**
+ * Turn a run of spoken number words into digits, the way people say numbers in emails:
+ * "two thousand and two" -> 2002, "twenty twenty four" -> 2024, "two zero zero two" -> 2002.
+ * Never leaves letters inside a number.
+ */
+export function parseNumberRun(words) {
+  const w = words.filter((x) => x !== 'and');
+  if (!w.length) return '';
+  if (w.some((x) => x === 'hundred' || x === 'thousand')) {
+    let total = 0, cur = 0;
+    for (const x of w) {
+      if (x in UNITS) cur += UNITS[x];
+      else if (x in TEENS) cur += TEENS[x];
+      else if (x in TENS) cur += TENS[x];
+      else if (x === 'hundred') cur = (cur || 1) * 100;
+      else if (x === 'thousand') { total += (cur || 1) * 1000; cur = 0; }
+    }
+    return String(total + cur);
+  }
+  if (w.every((x) => x in UNITS)) return w.map((x) => UNITS[x]).join('');
+  // Year-style groups: "twenty twenty two", "nineteen ninety nine", "twenty five".
+  const groups = [];
+  for (let i = 0; i < w.length; i++) {
+    if (w[i] in TEENS) groups.push(TEENS[w[i]]);
+    else if (w[i] in TENS) {
+      let v = TENS[w[i]];
+      if (w[i + 1] in UNITS && UNITS[w[i + 1]] > 0) { v += UNITS[w[i + 1]]; i++; }
+      groups.push(v);
+    } else groups.push(UNITS[w[i]]);
+  }
+  return groups.map((g, i) => (i > 0 && g < 10 ? `0${g}` : String(g))).join('');
+}
+
+// STT sometimes glues a spoken tail onto digits: "2000andtwo" -> "2002".
+function fixGluedNumbers(local) {
+  return local.replace(/(\d+)and(one|two|three|four|five|six|seven|eight|nine)(?![a-z])/g, (m, d, w) => (Number(d) % 10 === 0 ? String(Number(d) + UNITS[w]) : m));
+}
+
 const SYMBOL_WORDS = {
   at: '@', dot: '.', period: '.', point: '.', dash: '-', hyphen: '-', minus: '-',
   underscore: '_', plus: '+',
@@ -66,14 +105,22 @@ function tokenise(text) {
       const n = raw[i + 1];
       if (n === 'u' || n === 'you') { out.push({ t: 'L', v: 'w' }); i += 1; continue; }
       const rep = w === 'double' ? 2 : 3;
-      const d = /^\d$/.test(n) ? n : NUMBER_WORDS[n];
+      const d = /^\d$/.test(n) ? n : (n in UNITS ? String(UNITS[n]) : undefined);
       if (d !== undefined) { for (let k = 0; k < rep; k++) out.push({ t: 'D', v: d }); i += 1; continue; }
       if (/^[a-z]$/.test(n)) { for (let k = 0; k < rep; k++) out.push({ t: 'L', v: n }); i += 1; continue; }
     }
 
     if (SYMBOL_WORDS[w] !== undefined) { out.push({ t: 'S', v: SYMBOL_WORDS[w] }); continue; }
     if (/^\d+$/.test(w)) { for (const ch of w) out.push({ t: 'D', v: ch }); continue; }
-    if (NUMBER_WORDS[w] !== undefined) { out.push({ t: 'D', v: NUMBER_WORDS[w] }); continue; }
+    if (isNumWord(w)) {
+      // Gather the whole spoken number ("two thousand and two") and turn it into digits.
+      const run = [w];
+      let k = i + 1;
+      while (k < raw.length && (isNumWord(raw[k]) || (raw[k] === 'and' && run.some((x) => x === 'hundred' || x === 'thousand') && isNumWord(raw[k + 1] || '')))) { run.push(raw[k]); k++; }
+      for (const ch of parseNumberRun(run)) out.push({ t: 'D', v: ch });
+      i = k - 1;
+      continue;
+    }
     if (/^[a-z]$/.test(w)) {
       // "f as in foxtrot" / "f for frank": the letter stands, the helper word is dropped.
       out.push({ t: 'L', v: w });
@@ -135,8 +182,13 @@ export function findEmailInText(text) {
   const t = stripInvisible(text).replace(/\s*@\s*/g, '@');
   const all = t.match(INLINE_EMAIL);
   if (!all || !all.length) return '';
-  const e = all[all.length - 1].toLowerCase().replace(/^\.+/, '');
-  return EMAIL_RE.test(e) ? e : '';
+  let [local, domain] = all[all.length - 1].toLowerCase().replace(/^\.+/, '').split('@');
+  local = fixGluedNumbers(local);
+  // Speech-to-text sprinkles dots into names ("knox.favour"). A dot only stays if the caller actually said "dot".
+  if (!/\bdots?\b/i.test(t)) local = local.replace(/\./g, '');
+  local = local.replace(/^[.\-_+]+|[.\-_+]+$/g, '');
+  const e = `${local}@${domain}`;
+  return local && EMAIL_RE.test(e) ? e : '';
 }
 
 /** "remove the dots", "there's no dots in the middle": the caller wants dots out of the name part. */
@@ -148,6 +200,11 @@ export function stripLocalDots(email) {
   return local && domain ? `${local.replace(/\./g, '')}@${domain}` : email;
 }
 
+/** "Say it again", "repeat that", "spell the email out again". */
+export function asksRepeat(text) {
+  return /\b(say|read|repeat|spell)\b[^.?!]{0,18}\b(it|that|this|e-?mail)\b[^.?!]{0,12}\b(again|back|out)\b|\bsay (it|that) again\b|\bonce more\b|\bcome again\b|\brepeat (it|that)\b/i.test(String(text || ''));
+}
+
 /** "What was the email again?" once we already hold a confirmed one. */
 export function asksForEmailAgain(text) {
   return /\b(what|which)\b[^.?!]{0,30}\be-?mail\b|\b(repeat|read|say|spell)\b[^.?!]{0,25}\be-?mail\b[^.?!]{0,20}\b(again|back)\b|\be-?mail\b[^.?!]{0,15}\bagain\b/i.test(String(text || ''));
@@ -157,14 +214,15 @@ export function asksForEmailAgain(text) {
 export function parseSpokenEmail(text) {
   const tokens = tokenise(text);
   const atIdx = tokens.map((x) => (x.t === 'S' && x.v === '@' ? 1 : 0)).lastIndexOf(1);
+  const spelled = tokens.some((x, i) => x.t === 'L' && tokens[i + 1]?.t === 'L' && tokens[i + 2]?.t === 'L');
   if (atIdx < 0) {
-    return { complete: false, hasAt: false, local: buildLocal(tokens.filter((x) => x.t !== 'S' || x.v !== '@')), domain: '', email: '' };
+    return { spelled, complete: false, hasAt: false, local: buildLocal(tokens.filter((x) => x.t !== 'S' || x.v !== '@')), domain: '', email: '' };
   }
   const local = buildLocal(tokens.slice(0, atIdx));
   const domain = buildDomain(tokens.slice(atIdx + 1));
   const email = local && domain ? `${local}@${domain}` : '';
   const complete = !!email && EMAIL_RE.test(email);
-  return { complete, hasAt: true, local, domain, email: complete ? email : '' };
+  return { spelled, complete, hasAt: true, local, domain, email: complete ? email : '' };
 }
 
 // ---- when to run ----------------------------------------------------------------

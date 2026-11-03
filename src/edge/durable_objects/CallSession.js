@@ -23,7 +23,8 @@ import { getKnownCaller, saveContactToLead, saveLeadCallDetails,
   recordInboundLead,
 } from '../services/supabase.js';
 import { buildGreeting } from '../services/greeting.js';
-import { parseSpokenEmail, isEmailPrompt, yesNo, spokenReadback, domainResolves, findEmailInText, wantsDotsRemoved, stripLocalDots, asksForEmailAgain, EMAIL_PATTERN } from '../services/emailCapture.js';
+import { parseSpokenEmail, isEmailPrompt, yesNo, spokenReadback, domainResolves, findEmailInText, asksForEmailAgain, asksRepeat, EMAIL_PATTERN } from '../services/emailCapture.js';
+import { newDraft, draftEmail, applyCorrection, mergeRestatement } from '../services/emailFix.js';
 
 export class CallSession {
   constructor(state, env) {
@@ -696,30 +697,57 @@ export class CallSession {
     }
     if (!ec.active && !ec.pending) return false;
 
-    // The caller is answering our read-back.
+    // The caller is answering our read-back. Corrections edit a DRAFT of the address: parts they
+    // confirm are locked, parts they fix change, nothing else moves (see services/emailFix.js).
     if (ec.pending) {
       const yn = yesNo(transcript);
       if (yn === 'yes') { this.confirmEmail(ec.pending); return false; } // model carries on, told the address is confirmed
-      // "Remove the dots": fix that one thing and read it back, instead of starting over.
-      if (wantsDotsRemoved(transcript) && !findEmailInText(transcript)) {
-        const fixed = stripLocalDots(ec.pending);
-        if (fixed !== ec.pending) {
-          this.emailCap = { ...ec, pending: fixed };
-          this.sendToBrowser({ event: 'email_confirm', email: fixed });
-          await this.emailSay(`Okay, no dots. ${spokenReadback(fixed)}. Is that right?`);
-          return true;
-        }
+
+      const draft = ec.draft || newDraft(ec.pending);
+      const readBack = async (lead) => {
+        const email = draftEmail(draft);
+        this.emailCap = { ...this.emailCap, active: false, pending: email, draft, noCount: 0 };
+        this.sendToBrowser({ event: 'email_confirm', email });
+        await this.emailSay(`${lead} ${spokenReadback(email)}. Is that right?`);
+        return true;
+      };
+
+      if (asksRepeat(transcript)) return readBack('Sure.');
+
+      // They said the whole address again: merge it, without letting noise undo what is already confirmed.
+      const inline = findEmailInText(transcript);
+      const spoken = inline ? null : parseSpokenEmail(transcript);
+      if (inline || spoken?.complete) {
+        const r = mergeRestatement(draft, inline || spoken.email, { deliberate: !inline && !!spoken?.spelled });
+        console.log(`[Email] restated, now ${draftEmail(draft)}${r.conflict ? ' (kept confirmed parts)' : ''}`);
+        return readBack(r.changed ? 'Okay.' : 'That is what I have.');
       }
-      this.emailCap = { active: true, buf: '', pending: null, tries: ec.tries + 1, partialTurns: 0 };
-      if (yn === 'no') {
-        const t = this.emailCap.tries;
-        if (t >= 2) this.sendToBrowser({ event: 'email_confirm', email: '' });
-        await this.emailSay(t === 1
-          ? "No problem, let's do it again nice and slowly. Spell the part before the at sign, one letter at a time."
-          : "Sorry about that. One more time, one letter at a time, and take your time. You can also type it on your screen.");
+
+      // Piece-by-piece fixes: "knox is right, it's favour with an f", "the z is an f", "no dots".
+      const fix = applyCorrection(draft, transcript);
+      if (fix.needs) {
+        this.emailCap = { ...ec, pending: ec.pending, draft };
+        await this.emailSay("Okay. What should that part be? Spell just that part for me, slowly.");
         return true;
       }
-      // Neither yes nor no: they started spelling again, so fall through and treat it as the new attempt.
+      if (fix.changed) {
+        console.log(`[Email] fixed, now ${draftEmail(draft)}`);
+        return readBack('Got it.');
+      }
+
+      if (yn === 'no') {
+        const noCount = (ec.noCount || 0) + 1;
+        if (noCount >= 2) {
+          this.emailCap = { active: true, buf: '', pending: null, draft: null, tries: ec.tries + 1, partialTurns: 0 };
+          await this.emailSay("No problem, let's start fresh. Spell the part before the at sign, one letter at a time.");
+          return true;
+        }
+        this.emailCap = { ...ec, draft, noCount };
+        await this.emailSay("Which part should I change? Tell me what is right, like knox is right, and then the part to fix.");
+        return true;
+      }
+      // Neither a yes, a no nor a fix: treat it as a fresh attempt below.
+      this.emailCap = { active: true, buf: '', pending: null, draft: null, tries: ec.tries, partialTurns: 0 };
     }
 
     const cap = this.emailCap;
@@ -759,7 +787,7 @@ export class CallSession {
       return true;
     }
 
-    this.emailCap = { active: false, buf: '', pending: p.email, tries: cap.tries, partialTurns: 0 };
+    this.emailCap = { active: false, buf: '', pending: p.email, draft: newDraft(p.email), tries: cap.tries, partialTurns: 0 };
     this.sendToBrowser({ event: 'email_confirm', email: p.email });
     console.log(`[Email] heard: ${p.email}`);
     await this.emailSay(`Let me read that back. ${spokenReadback(p.email)}. Did I get that right?`);
@@ -770,7 +798,7 @@ export class CallSession {
   async onEmailFromScreen(raw) {
     const email = String(raw || '').trim().toLowerCase().replace(/[\u200B-\u200D\uFEFF]/g, '');
     if (!EMAIL_PATTERN.test(email) || this.isProcessing || this.ending) return;
-    this.emailCap = { active: false, buf: '', pending: email, tries: 0, partialTurns: 0 };
+    this.emailCap = { active: false, buf: '', pending: email, draft: newDraft(email), tries: 0, partialTurns: 0 };
     this.isProcessing = true;
     try {
       await this.processTurn('Yes, that is right.');
