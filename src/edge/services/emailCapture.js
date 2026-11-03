@@ -98,7 +98,13 @@ function buildLocal(tokens) {
     if (tokens[i].t === 'L' && tokens[i + 1].t === 'L' && tokens[i + 2].t === 'L') { runStart = i; break; }
   }
   let use = tokens;
-  if (runStart >= 0) use = tokens.slice(runStart).filter((x) => x.t !== 'W');
+  if (runStart >= 0) {
+    // Keep words spoken after the spelling ("k n o x favour 2002"), but drop a word that merely repeats the spelled letters.
+    let j = runStart;
+    while (j < tokens.length && tokens[j].t === 'L') j++;
+    const spelled = tokens.slice(runStart, j).map((x) => x.v).join('');
+    use = tokens.slice(runStart).filter((x) => !(x.t === 'W' && x.v === spelled));
+  }
   let local = use.map((x) => x.v).join('');
   // The caller said it twice in a row: collapse "knoxknox" to "knox".
   const half = local.length / 2;
@@ -121,6 +127,32 @@ function buildDomain(tokens) {
   return d;
 }
 
+// Deepgram often hands us a finished address ("knoxfavour2002@Gmail.com") in one piece.
+// When the caller's latest sentence contains one, that is the most trustworthy thing we have:
+// no stitching, no leftover words from "it's an email and I wanted to use ...".
+const INLINE_EMAIL = /[a-z0-9][a-z0-9._%+-]*@[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}/gi;
+export function findEmailInText(text) {
+  const t = stripInvisible(text).replace(/\s*@\s*/g, '@');
+  const all = t.match(INLINE_EMAIL);
+  if (!all || !all.length) return '';
+  const e = all[all.length - 1].toLowerCase().replace(/^\.+/, '');
+  return EMAIL_RE.test(e) ? e : '';
+}
+
+/** "remove the dots", "there's no dots in the middle": the caller wants dots out of the name part. */
+export function wantsDotsRemoved(text) {
+  return /\b(no|remove|without|delete|take out|get rid of|drop)\b[^.?!]{0,30}\bdots?\b/i.test(String(text || ''));
+}
+export function stripLocalDots(email) {
+  const [local, domain] = String(email).split('@');
+  return local && domain ? `${local.replace(/\./g, '')}@${domain}` : email;
+}
+
+/** "What was the email again?" once we already hold a confirmed one. */
+export function asksForEmailAgain(text) {
+  return /\b(what|which)\b[^.?!]{0,30}\be-?mail\b|\b(repeat|read|say|spell)\b[^.?!]{0,25}\be-?mail\b[^.?!]{0,20}\b(again|back)\b|\be-?mail\b[^.?!]{0,15}\bagain\b/i.test(String(text || ''));
+}
+
 /** Parse everything the caller has said so far into an address. */
 export function parseSpokenEmail(text) {
   const tokens = tokenise(text);
@@ -140,20 +172,25 @@ export function parseSpokenEmail(text) {
 /** Did the agent just ask for an email (and not merely read one back)? */
 export function isEmailPrompt(text) {
   const t = String(text || '');
-  const mentionsEmail = /\be-?mail\b/i.test(t) || /\bat sign\b/i.test(t);
-  if (!mentionsEmail) return false;
-  // A read-back or a confirmation question is not a request for the address.
-  if (/\b(did i get|is that (right|correct)|am i right|got it right|have it right)\b/i.test(t)) return false;
-  if (/\b(right|correct)\b[^a-z]*$/i.test(t.trim())) return false;
-  const asks = /\b(spell|best e-?mail|your e-?mail|the e-?mail|what('| i)?s (the|your)|could i (get|have)|can i (get|have)|may i (get|have)|share|give me|go ahead|need)\b/i.test(t);
-  return asks && /[?]|\bplease\b|\bslowly\b/i.test(t);
+  if (t.includes('@')) return false; // that is a read-back, not a request
+  // Judge each sentence on its own: "how long have you waited?" next to a mention of email is not an email request.
+  const sentences = t.match(/[^.!?]+[.!?]*/g) || [t];
+  return sentences.some((sent) => {
+    if (!/\be-?mail\b|\bat sign\b/i.test(sent)) return false;
+    if (/\b(did i get|is that (right|correct)|am i right|got it right|have it right)\b/i.test(sent)) return false;
+    if (/\b(right|correct)\b[^a-z]*$/i.test(sent.trim())) return false;
+    const asks = /\b(spell|best e-?mail|your e-?mail|the e-?mail|what('| i)?s (the|your)|could i (get|have)|can i (get|have)|may i (get|have)|share|give me|go ahead|need)\b/i.test(sent);
+    return asks && /[?]|\bplease\b|\bslowly\b/i.test(sent);
+  });
 }
 
 export function yesNo(text) {
-  const t = String(text || '').trim().toLowerCase().replace(/[.!?,]+/g, ' ').replace(/\s+/g, ' ');
+  const t = String(text || '').trim().toLowerCase().replace(/[.!?,]+/g, ' ').replace(/\s+/g, ' ').trim();
+  // "you got it right BUT remove the dots" is a correction, not a yes.
+  if (/\b(but|except|however|remove|change|without|instead|should be|supposed to|not|wrong|incorrect|dots?)\b/.test(t) && !/^(no|nope|nah)\b/.test(t)) return null;
   if (/^(no|nope|nah|not (right|correct|quite)|wrong|incorrect|that'?s (not|wrong)|it'?s not|it is not)\b/.test(t)) return 'no';
-  if (/\b(not correct|isn'?t (right|correct)|is not (right|correct)|wrong)\b/.test(t) && !/^(yes|yeah|yep)/.test(t)) return 'no';
-  if (/^(yes|yeah|yep|yup|yea|correct|right|exactly|perfect|sure|ok|okay|uh huh|that'?s (right|correct)|you got it|sounds right)\b/.test(t)) return 'yes';
+  // A real yes is short. A long sentence that merely starts with "yes" is probably more instructions.
+  if (t.split(' ').length <= 7 && /^(yes|yeah|yep|yup|yea|correct|right|exactly|perfect|sure|ok|okay|uh huh|that'?s (right|correct)|you got it|sounds right|it works)\b/.test(t)) return 'yes';
   return null;
 }
 

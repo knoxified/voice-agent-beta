@@ -275,7 +275,7 @@ export async function executeTool(session, call) {
   // The code-assembled, caller-confirmed address wins over a model that mis-copied a letter.
   for (const k of ['email', 'callback_email']) {
     const given = String(args[k] || '').trim().toLowerCase();
-    if (given && session.confirmedEmail && given !== session.confirmedEmail && editDistance(given, session.confirmedEmail) <= 5) {
+    if (given && session.confirmedEmail && given !== session.confirmedEmail && editDistance(given, session.confirmedEmail) <= 3) {
       console.warn(`[Email] tool ${name} had ${given}; using the confirmed ${session.confirmedEmail}`);
       args[k] = session.confirmedEmail;
     }

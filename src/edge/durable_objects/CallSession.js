@@ -23,7 +23,7 @@ import { getKnownCaller, saveContactToLead, saveLeadCallDetails,
   recordInboundLead,
 } from '../services/supabase.js';
 import { buildGreeting } from '../services/greeting.js';
-import { parseSpokenEmail, isEmailPrompt, yesNo, spokenReadback, domainResolves, EMAIL_PATTERN } from '../services/emailCapture.js';
+import { parseSpokenEmail, isEmailPrompt, yesNo, spokenReadback, domainResolves, findEmailInText, wantsDotsRemoved, stripLocalDots, asksForEmailAgain, EMAIL_PATTERN } from '../services/emailCapture.js';
 
 export class CallSession {
   constructor(state, env) {
@@ -687,12 +687,29 @@ export class CallSession {
   // Returns true when this turn was fully handled here (the model must not answer it).
   async handleEmailCapture(transcript) {
     const ec = this.emailCap;
+
+    // "What was the email again?" Our code reads it back, so the model never improvises letters.
+    if (!ec.active && !ec.pending && this.confirmedEmail && asksForEmailAgain(transcript)) {
+      this.emailCap = { active: false, buf: '', pending: this.confirmedEmail, tries: 0, partialTurns: 0 };
+      await this.emailSay(`Sure. ${spokenReadback(this.confirmedEmail)}. Is that right?`);
+      return true;
+    }
     if (!ec.active && !ec.pending) return false;
 
     // The caller is answering our read-back.
     if (ec.pending) {
       const yn = yesNo(transcript);
       if (yn === 'yes') { this.confirmEmail(ec.pending); return false; } // model carries on, told the address is confirmed
+      // "Remove the dots": fix that one thing and read it back, instead of starting over.
+      if (wantsDotsRemoved(transcript) && !findEmailInText(transcript)) {
+        const fixed = stripLocalDots(ec.pending);
+        if (fixed !== ec.pending) {
+          this.emailCap = { ...ec, pending: fixed };
+          this.sendToBrowser({ event: 'email_confirm', email: fixed });
+          await this.emailSay(`Okay, no dots. ${spokenReadback(fixed)}. Is that right?`);
+          return true;
+        }
+      }
       this.emailCap = { active: true, buf: '', pending: null, tries: ec.tries + 1, partialTurns: 0 };
       if (yn === 'no') {
         const t = this.emailCap.tries;
@@ -710,8 +727,12 @@ export class CallSession {
       this.emailCap = { active: false, buf: '', pending: null, tries: 0, partialTurns: 0 };
       return false;
     }
-    cap.buf = `${cap.buf} ${transcript}`.trim();
-    const p = parseSpokenEmail(cap.buf);
+    // A finished address in the caller's latest sentence beats stitching fragments together.
+    const inline = findEmailInText(transcript);
+    cap.buf = inline ? transcript : `${cap.buf} ${transcript}`.trim();
+    const p = inline
+      ? { complete: true, hasAt: true, local: inline.split('@')[0], domain: inline.split('@')[1], email: inline }
+      : parseSpokenEmail(cap.buf);
 
     if (!p.complete) {
       const wordCount = String(transcript).trim().split(/\s+/).length;
@@ -732,9 +753,9 @@ export class CallSession {
     }
 
     if (!(await domainResolves(p.domain))) {
-      cap.buf = `${p.local.split('').join(' ')} at`;
+      cap.buf = '';
       cap.partialTurns += 1;
-      await this.emailSay("I couldn't find that website name. Could you spell the part after the at sign again for me?");
+      await this.emailSay("I couldn't find that website name. Could you say the whole email again, and spell the part after the at sign?");
       return true;
     }
 
