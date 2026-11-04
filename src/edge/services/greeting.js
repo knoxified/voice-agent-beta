@@ -38,17 +38,18 @@ function buildGreeting(agentConfig, customGreeting, recordingEnabled = false, ai
   const agentName = cfg.agent_nickname || 'your assistant';
   const companyName = cfg.organization_name || 'this business';
 
-  // Default opening: "Hello, this is <name>" -- a warm, person-first
-  // opener -- followed by whichever disclosures apply in the SAME clause,
-  // then a question so the caller knows it is their turn to speak. The
-  // agent name is whatever the account has (the DB default is "Alex" until
-  // the customer names it themselves). Disclosure is never optional here:
-  // it is legally required up front in some jurisdictions. A custom
-  // greeting can still say the business name via {{company}}.
-  const identity = aiDisclosureRequired ? `${agentName}, an AI assistant` : agentName;
+  // Default opening: "Hi/Hello, this is <name>, an AI assistant from <company>. How can I help you today?"
+  // - The company name makes it sound like a real front desk, not a generic bot.
+  // - "an AI assistant" sits right after the NAME, so it can never read as if the company is the AI.
+  // - The AI disclosure stays unless the account turns off require_ai_disclosure; the recording
+  //   notice appears only when call recording is enabled. Both are legal matters, not style.
+  const hasCompany = !!(cfg.organization_name && String(cfg.organization_name).trim());
+  const from = hasCompany ? ` from ${companyName}` : '';
+  const who = aiDisclosureRequired ? `${agentName}, an AI assistant${from}` : `${agentName}${from}`;
+  const opener = Math.random() < 0.5 ? 'Hi' : 'Hello';
   const identityClause = recordingEnabled
-    ? `Hello, this is ${identity}, ${RECORDING_NOTICE}.`
-    : `Hello, this is ${identity}.`;
+    ? `${opener}, this is ${who}, ${RECORDING_NOTICE}.`
+    : `${opener}, this is ${who}.`;
   const defaultGreeting = `${identityClause} How can I help you today?`;
 
   if (customGreeting && customGreeting.trim().length > 0 && customGreeting.trim() !== GENERIC_DEFAULT_GREETING) {
