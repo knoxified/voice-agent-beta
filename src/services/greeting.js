@@ -41,14 +41,12 @@ function buildGreeting(agentConfig, customGreeting, recordingEnabled = false, ai
   const agentName = cfg.agent_nickname || 'your assistant';
   const companyName = cfg.organization_name || 'this business';
 
-  // Default opening: "Hi/Hello, this is <name>, an AI assistant from <company>. How can I help you today?"
-  // - The company name makes it sound like a real front desk, not a generic bot.
-  // - "an AI assistant" sits right after the NAME, so it can never read as if the company is the AI.
-  // - The AI disclosure stays unless the account turns off require_ai_disclosure; the recording
-  //   notice appears only when call recording is enabled. Both are legal matters, not style.
+  // Default opening: "Hi/Hello, this is <name> from <company>. How can I help you today?"
+  // The recording notice is added only when call recording is enabled. The AI disclosure is no
+  // longer spoken in the greeting (owner's decision); the agent still never claims to be human and
+  // says it is an AI if a caller sincerely asks (see the system prompt).
   const hasCompany = !!(cfg.organization_name && String(cfg.organization_name).trim());
-  const from = hasCompany ? ` from ${companyName}` : '';
-  const who = aiDisclosureRequired ? `${agentName}, an AI assistant${from}` : `${agentName}${from}`;
+  const who = `${agentName}${hasCompany ? ` from ${companyName}` : ''}`;
   const opener = Math.random() < 0.5 ? 'Hi' : 'Hello';
   const identityClause = recordingEnabled
     ? `${opener}, this is ${who}, ${RECORDING_NOTICE}.`
@@ -68,7 +66,7 @@ function buildGreeting(agentConfig, customGreeting, recordingEnabled = false, ai
     const hasAiPlaceholder = /\{\{\s*ai_disclosure\s*\}\}/i.test(greeting);
     greeting = greeting
       .replace(/\{\{\s*recording_notice\s*\}\}/gi, recordingEnabled ? RECORDING_NOTICE : '')
-      .replace(/\{\{\s*ai_disclosure\s*\}\}/gi, aiDisclosureRequired ? AI_DISCLOSURE_NOTICE : '');
+      .replace(/\{\{\s*ai_disclosure\s*\}\}/gi, AI_DISCLOSURE_NOTICE);
 
     const leftover = greeting.match(/\{\{\s*[\w-]+\s*\}\}/);
     if (leftover) {
@@ -86,7 +84,6 @@ function buildGreeting(agentConfig, customGreeting, recordingEnabled = false, ai
     // company itself is "an AI assistant" ("this is Alice from Acme, an AI
     // assistant"), so a separate sentence is both clearer and legally safer.
     const missingParts = [];
-    if (aiDisclosureRequired && !hasAiPlaceholder) missingParts.push("I'm an AI assistant");
     if (recordingEnabled && !hasRecordingPlaceholder) missingParts.push(`this call is ${RECORDING_NOTICE}`);
 
     if (missingParts.length > 0) {
