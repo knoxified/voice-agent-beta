@@ -9,6 +9,8 @@ import { buildGreeting } from './services/greeting.js';
 import { createClient } from '@supabase/supabase-js';
 import { CallSession } from './durable_objects/CallSession.js';
 import { processDueEmails, unsubscribeByToken } from './services/emailSender.js';
+import { kickNumberRetries } from './services/numberRetry.js';
+import { webhookAuthMode, verifyTelnyx, verifyTwilioStyle } from './services/webhookAuth.js';
 
 export { CallSession };
 
@@ -230,10 +232,22 @@ app.post('/twiml/web-call', async (c) => {
 });
 
 app.post('/voice/inbound', async (c) => {
+  const mode = webhookAuthMode(c.env);
+  const rawClone = mode !== 'off' ? c.req.raw.clone() : null; // Telnyx signs the exact raw body
   const body = await parseInboundBody(c.req);
 
   const isTwilio = !!(body.CallSid && body.From);
   const isTelnyx = !!(body?.data?.event_type);
+
+  if (rawClone && (isTwilio || isTelnyx)) {
+    const check = isTelnyx
+      ? await verifyTelnyx(c.env, c.req.raw.headers, await rawClone.text())
+      : await verifyTwilioStyle(c.env, c.req.raw.headers, `${c.env.BASE_URL}/voice/inbound`, body);
+    if (!check.ok) {
+      console.warn(`[WebhookAuth] ${isTelnyx ? 'telnyx' : 'twilio-style'} check failed (${mode}): ${check.reason}`);
+      if (mode === 'enforce') return c.text('Forbidden', 403);
+    }
+  }
 
   if (isTwilio) return handleTwilioInbound(c, body);
   if (isTelnyx) return handleTelnyxInbound(c, body);
@@ -542,5 +556,6 @@ export default {
   // Cron trigger (wrangler.jsonc): sends whichever sequence emails are due.
   async scheduled(event, env, ctx) {
     ctx.waitUntil(processDueEmails(env));
+    ctx.waitUntil(kickNumberRetries(env));
   },
 };
