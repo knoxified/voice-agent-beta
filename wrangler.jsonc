@@ -3,7 +3,7 @@
   "main": "src/edge/index.js",
   "compatibility_date": "2026-08-01",
   "triggers": {
-    "crons": ["* * * * *"]
+    "crons": ["*/10 * * * *"]
   },
   "observability": {
     "enabled": true

@@ -29,7 +29,9 @@ async function getUserByPhone(env, phoneNumber) {
       `)
       .eq('phone_number', phoneNumber)
       .eq('is_active', true)
-      .single();
+      .is('released_at', null)
+      .not('verified_at', 'is', null)
+      .maybeSingle();
 
     if (error || !data) {
       console.warn(`[Supabase] User not found for phone ${phoneNumber}`);

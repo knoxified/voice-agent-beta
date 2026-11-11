@@ -265,17 +265,16 @@ app.post('/voice/recording-status', async (c) => {
 
 async function handleTwilioInbound(c, body) {
   const { CallSid, From, To, ForwardedFrom } = body;
-  const lookupNumber = resolveDialedNumber({ to: To, forwardedFrom: ForwardedFrom });
-  console.log(`[Twilio] Inbound call from ${From} to ${To} (lookup: ${lookupNumber}) | SID: ${CallSid}`);
+  console.log(`[Inbound] Call from ${From} to ${To} (forwardedFrom: ${ForwardedFrom || 'none'}) | SID: ${CallSid}`);
 
-  const user = await getUserByPhone(c.env, lookupNumber);
+  const user = await findUserForCall(c.env, To, ForwardedFrom);
   if (!user) {
     // Shared-number call-forwarding setup: this fires whenever we can't
     // tell which client's forwarded business number this call was
     // originally dialed to. Logged so the real Twilio payload can be
     // inspected (see phone_number_mappings / ForwardedFrom docs) rather
     // than guessing further blind.
-    await logUnmatchedInboundCall(c.env, body, lookupNumber);
+    await logUnmatchedInboundCall(c.env, body, ForwardedFrom || To);
     return twimlResponse(sayAndHangup('This number is not currently in service. Goodbye.'));
   }
 
@@ -331,13 +330,11 @@ async function handleTelnyxInbound(c, body) {
       event.payload?.custom_headers?.find?.((h) => /^diversion$/i.test(h.name))?.value ||
       event.payload?.custom_headers?.find?.((h) => /^history-info$/i.test(h.name))?.value ||
       null;
-    const lookupNumber = resolveDialedNumber({ to: toNumber, forwardedFrom: divertedNumber });
+    console.log(`[Telnyx] Inbound call from ${fromNumber} to ${toNumber} (diverted: ${divertedNumber || 'none'})`);
 
-    console.log(`[Telnyx] Inbound call from ${fromNumber} to ${toNumber} (lookup: ${lookupNumber})`);
-
-    const user = await getUserByPhone(c.env, lookupNumber);
+    const user = await findUserForCall(c.env, toNumber, divertedNumber);
     if (!user) {
-      await logUnmatchedInboundCall(c.env, event, lookupNumber);
+      await logUnmatchedInboundCall(c.env, event, divertedNumber || toNumber);
       // Must answer before we can speak -- Telnyx won't play audio on an
       // unanswered call.
       await telnyxAnswer(c.env, callControlId);
@@ -464,8 +461,15 @@ async function startTwilioRecording(env, callSid, statusCallbackUrl) {
   }
 }
 
-function resolveDialedNumber({ to, forwardedFrom }) {
-  return forwardedFrom || to;
+// A customer's own dedicated number identifies them exactly, so the number
+// that was dialed is always tried first. Only if it matches nobody (a shared
+// number) do we fall back to the original number a carrier may have passed
+// through on a forwarded call.
+async function findUserForCall(env, to, forwardedFrom) {
+  const direct = to ? await getUserByPhone(env, to) : null;
+  if (direct) return direct;
+  if (forwardedFrom && forwardedFrom !== to) return getUserByPhone(env, forwardedFrom);
+  return null;
 }
 
 function sayAndHangup(text) {
