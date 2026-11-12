@@ -9,7 +9,7 @@ import { buildGreeting } from './services/greeting.js';
 import { createClient } from '@supabase/supabase-js';
 import { CallSession } from './durable_objects/CallSession.js';
 import { processDueEmails, unsubscribeByToken } from './services/emailSender.js';
-import { kickNumberRetries } from './services/numberRetry.js';
+import { kickNumberRetries, kickNumberRelease } from './services/numberRetry.js';
 import { webhookAuthMode, verifyTelnyx, verifyTwilioStyle } from './services/webhookAuth.js';
 
 export { CallSession };
@@ -557,5 +557,6 @@ export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(processDueEmails(env));
     ctx.waitUntil(kickNumberRetries(env));
+    ctx.waitUntil(kickNumberRelease(env));
   },
 };

@@ -155,3 +155,24 @@ export async function sendDemoBookingEmail(env, { toEmail, toName, industry, sta
 
   console.log(`[Demo] Booking confirmation sent to ${toEmail}`);
 }
+
+export async function sendNumberReadyEmail(env, { toEmail, number }) {
+  if (!env.BREVO_API_KEY || !toEmail) return;
+  const htmlContent = `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;color:#0f172a;max-width:520px;margin:0 auto;padding:24px;">
+<h2 style="margin:0 0 12px;">Your Knoxified number is ready</h2>
+<p style="font-size:15px;line-height:1.6;">Your agent now answers calls on:</p>
+<p style="font-size:22px;font-weight:bold;font-family:monospace;margin:12px 0;">${number}</p>
+<p style="font-size:15px;line-height:1.6;">Share it directly, or forward your business line to it so the agent picks up when you can't. Forwarding steps are in Agent Config in your dashboard.</p>
+<p style="font-size:13px;color:#94a3b8;margin-top:28px;">Knoxified &middot; AI Voice Agents</p></body></html>`;
+  const res = await fetch(BREVO_API, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'api-key': env.BREVO_API_KEY },
+    body: JSON.stringify({
+      sender: { email: env.BREVO_SENDER_EMAIL || 'no-reply@mail.knoxified.org', name: env.BREVO_SENDER_NAME || 'Knoxified' },
+      to: [{ email: toEmail }],
+      subject: 'Your Knoxified number is ready',
+      htmlContent,
+    }),
+  });
+  if (!res.ok) throw new Error(`Brevo send failed (${res.status})`);
+}
