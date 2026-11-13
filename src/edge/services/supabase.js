@@ -143,6 +143,23 @@ async function getUsedSecondsThisMonth(supabase, userId) {
   );
 }
 
+/**
+ * Monthly minute cap including partner bonus minutes (bonus_grants). Falls back to
+ * the plain plan limit if the lookup fails, so a problem here can never block calls
+ * that the plan alone would allow. 0 = unlimited, same as before.
+ */
+async function getEffectiveLimitMinutes(supabase, userId, planLimit) {
+  try {
+    const { data, error } = await supabase.rpc('get_effective_limits', { p_user_id: userId });
+    if (error) throw new Error(error.message);
+    const row = Array.isArray(data) ? data[0] : data;
+    if (row && typeof row.limit_voice_minutes === 'number') return row.limit_voice_minutes;
+  } catch (err) {
+    console.error('[Supabase] get_effective_limits failed, using plan limit:', err.message);
+  }
+  return planLimit;
+}
+
 async function checkQuota(env, userId) {
   const supabase = db(env);
   const GENERIC_MESSAGE = 'Sorry, your minutes have been exhausted. Please upgrade your plan.';
@@ -168,7 +185,7 @@ async function checkQuota(env, userId) {
     // even on a paid plan in the rare case a paid account gets flagged.
     if (userData.credits_locked) return { ok: false, message: GENERIC_MESSAGE };
 
-    const limitMinutes = userData.plans?.limit_voice_minutes || 0;
+    const limitMinutes = await getEffectiveLimitMinutes(supabase, userId, userData.plans?.limit_voice_minutes || 0);
     if (limitMinutes === 0) return { ok: true, message: null }; // 0 = unlimited
 
     const usedSeconds = await getUsedSecondsThisMonth(supabase, userId);
@@ -204,7 +221,7 @@ async function getRemainingMinutes(env, userId) {
       .eq('id', userId)
       .single();
 
-    const limitMinutes = userData?.plans?.limit_voice_minutes || 0;
+    const limitMinutes = await getEffectiveLimitMinutes(supabase, userId, userData?.plans?.limit_voice_minutes || 0);
     if (limitMinutes === 0) return Number.MAX_SAFE_INTEGER; // Unlimited
 
     const usedSeconds = await getUsedSecondsThisMonth(supabase, userId);
