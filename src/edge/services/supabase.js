@@ -566,21 +566,26 @@ async function getAgentConfig(env, userId) {
   try {
     const BASE_COLS =
       'organization_name, agent_nickname, agent_position, business_hours, business_location, main_call_to_action, custom_system_prompt, memory_context, negative_instructions, call_recording_enabled, temperature, system_type, require_ai_disclosure, custom_intents, business_phone';
-    // Newer optional columns (website knowledge, business timezone) may not be migrated yet.
-    // Try the richest select first and drop only what is missing, so a missing
-    // `timezone` column never costs the tenant their FAQs (or the other way round).
-    const attempts = [
-      `${BASE_COLS}, website_summary, faqs, timezone, calendar_provider`,
-      `${BASE_COLS}, website_summary, faqs, timezone`,
-      `${BASE_COLS}, website_summary, faqs`,
-      `${BASE_COLS}, timezone`,
-      BASE_COLS,
-    ];
+    // Newer optional columns may not be migrated yet. Select them all, and if Postgres says one
+    // is missing, drop just that one and retry -- so an unmigrated column never costs the tenant
+    // their whole config (or their other new columns).
+    const optional = ['website_summary', 'faqs', 'timezone', 'calendar_provider', 'ai_disclosure_enabled'];
     let data = null;
     let error = null;
-    for (const cols of attempts) {
+    for (let i = 0; i <= optional.length; i++) {
+      const cols = [BASE_COLS, ...optional].join(', ');
       ({ data, error } = await supabase.from('agent_configs').select(cols).eq('user_id', userId).maybeSingle());
-      if (!error || !/website_summary|faqs|timezone|does not exist|could not find/i.test(error.message || '')) break;
+      if (!error) break;
+      const msg = error.message || '';
+      const m = msg.match(/column\s+(?:["\w]+\.)?"?(\w+)"?\s+does not exist/i) || msg.match(/Could not find the '(\w+)' column/i);
+      const missing = m && optional.indexOf(m[1]);
+      if (m && missing >= 0) {
+        optional.splice(missing, 1);
+      } else if (/does not exist|could not find/i.test(msg)) {
+        optional.length = 0; // unparseable -> fall back to base columns only
+      } else {
+        break;
+      }
     }
 
     if (error || !data) return null;

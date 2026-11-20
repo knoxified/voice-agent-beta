@@ -356,7 +356,7 @@ export class CallSession {
         agent_nickname: 'Alex',
         system_type: this.systemTypeOverride,
         main_call_to_action: 'schedule a visit or appointment',
-        require_ai_disclosure: true,
+        ai_disclosure_enabled: false,
         call_recording_enabled: false,
       };
       this.routingRules = [];
@@ -476,11 +476,9 @@ export class CallSession {
 
     try {
       const recordingEnabled = Boolean(this.agentConfig?.call_recording_enabled);
-      // Defaults to required (matches the DB column's own default) --
-      // fail-safe toward MORE disclosure, not less, for a real legal
-      // requirement. Only skipped if explicitly set to false.
-      const aiDisclosureRequired = this.agentConfig?.require_ai_disclosure !== false;
-      const greetingText = buildGreeting(this.agentConfig, this.voiceSettingsGreeting, recordingEnabled, aiDisclosureRequired);
+      // Owner-controlled toggle, off by default (dashboard: Agent config).
+      const aiDisclosureEnabled = Boolean(this.agentConfig?.ai_disclosure_enabled);
+      const greetingText = buildGreeting(this.agentConfig, this.voiceSettingsGreeting, recordingEnabled, aiDisclosureEnabled);
       console.log(`[Stream] Synthesizing greeting: "${greetingText}"`);
       await this.speak(greetingText);
       console.log('[Stream] Greeting sent');

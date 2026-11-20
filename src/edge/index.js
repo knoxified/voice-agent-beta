@@ -130,7 +130,7 @@ app.post('/voice/preview', async (c) => {
   const nameOverride = typeof body.agentName === 'string' ? body.agentName.trim().slice(0, 40) : '';
   const previewConfig = nameOverride ? { ...(agentConfig || {}), agent_nickname: nameOverride } : agentConfig;
 
-  const previewText = buildGreeting(previewConfig, voiceSettings?.agent_greeting, false, agentConfig?.require_ai_disclosure !== false);
+  const previewText = buildGreeting(previewConfig, voiceSettings?.agent_greeting, false, Boolean(agentConfig?.ai_disclosure_enabled));
 
   try {
     const audio = await synthesizeSpeech(c.env, previewText, voiceOverride || voiceSettings?.preferred_voice_id, 'mp3');
