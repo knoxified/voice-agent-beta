@@ -1,7 +1,7 @@
 import { createLiveTranscription, sendAudio as sendToDeepgram, keepAlive } from '../services/stt.js';
 import { generateWithTools, streamWithTools } from '../services/llm.js';
 import { synthesizeSpeech, streamSpeech, EMOTIONS } from '../services/tts.js';
-import { TOOL_DEFS, MANAGE_TOOLS, QUESTION_TOOL, MESSAGE_TOOL, NAME_TOOL, LOOKUP_TOOL, executeTool, businessTimeZone, calendarProvider } from '../services/tools.js';
+import { TOOL_DEFS, MANAGE_TOOLS, QUESTION_TOOL, MESSAGE_TOOL, NAME_TOOL, LOOKUP_TOOL, executeTool, businessTimeZone, calendarProvider, canManageAppointments } from '../services/tools.js';
 import { decideOutcome, buildCallSummary } from '../services/callSummary.js';
 import { classifyStage } from '../services/qualifier.js';
 import { pickRelevant, splitChunks } from '../services/knowledge.js';
@@ -84,7 +84,7 @@ export class CallSession {
     this.lastInterruptAt = 0;
     this.bookingsMade = 0;
     this.bookingConfirmed = null;
-    this.manageIntent = false; // caller wants to reschedule / cancel an existing appointment (Cal.com only)
+    this.manageIntent = false; // caller wants to reschedule / cancel an existing appointment (Cal.com or Google via n8n)
     this.knownCaller = null;
     this.capturedContact = null;
     this.questionsLogged = 0;
@@ -547,7 +547,7 @@ export class CallSession {
 
       for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
         const lookup = (this.kbFaqs?.length || this.kbWebsite?.length || this.kbMemory?.length) ? [LOOKUP_TOOL] : [];
-          const toolList = round < MAX_TOOL_ROUNDS ? (this.actionUnlocked ? [...TOOL_DEFS, ...(calendarProvider(this) === 'calcom' ? MANAGE_TOOLS : []), NAME_TOOL, ...lookup, QUESTION_TOOL, MESSAGE_TOOL] : [NAME_TOOL, ...lookup, QUESTION_TOOL, MESSAGE_TOOL]) : null;
+          const toolList = round < MAX_TOOL_ROUNDS ? (this.actionUnlocked ? [...TOOL_DEFS, ...(canManageAppointments(this) ? MANAGE_TOOLS : []), NAME_TOOL, ...lookup, QUESTION_TOOL, MESSAGE_TOOL] : [NAME_TOOL, ...lookup, QUESTION_TOOL, MESSAGE_TOOL]) : null;
 
         // Speak each sentence as the model writes it, so the first words reach
         // the caller while the rest is still being generated. If streaming
@@ -972,7 +972,7 @@ export class CallSession {
       .catch(() => { this.bookingFailed = failedBefore; });
   }
 
-  // Caller wants to change or cancel an EXISTING appointment (Cal.com tenants).
+  // Caller wants to change or cancel an EXISTING appointment (Cal.com or Google tenants).
   manageHint(L, tz) {
     L.push('The caller wants to RESCHEDULE or CANCEL an appointment they already have. Never use book_appointment for this, and never claim a change is done until the tool says so.');
     L.push('1) If it is unclear, ask once whether they want to move it or cancel it.');
@@ -1030,9 +1030,9 @@ export class CallSession {
     // Fast path (no model call): when the caller plainly asks to book or asks which day/time is free,
     // they have already agreed. Skip qualifying and unlock the booking tools right now.
     const lastUser = [...this.messages].reverse().find((m) => m.role === 'user')?.content || '';
-    // Changing or cancelling an existing appointment (Cal.com tenants): unlock the calendar and the
+    // Changing or cancelling an existing appointment (Cal.com or Google tenants): unlock the calendar and the
     // manage tools right away, and skip the speculative next-day lookup (not wanted for a cancellation).
-    if (!this.manageIntent && calendarProvider(this) === 'calcom' && MANAGE_INTENT_RE.test(lastUser)) {
+    if (!this.manageIntent && canManageAppointments(this) && MANAGE_INTENT_RE.test(lastUser)) {
       console.log(`[Stage] ${this.stage} -> agreed (caller wants to change or cancel an existing appointment)`);
       this.manageIntent = true;
       this.prefetchStarted = true;

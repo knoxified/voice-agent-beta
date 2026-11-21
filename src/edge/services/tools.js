@@ -138,7 +138,14 @@ export function calendarProvider(session) {
   return String(session.agentConfig?.calendar_provider || 'google').toLowerCase();
 }
 
-// Only offered when the tenant's calendar is Cal.com (the n8n/Google workflow has no reschedule or cancel).
+// Offered when the tenant's calendar is Cal.com (direct) or Google via the AppointMate n8n workflow
+// (cancelAppointment / rescheduleAppointment branches). Never in demo mode.
+export function canManageAppointments(session) {
+  if (session.isDemo) return false;
+  const p = calendarProvider(session);
+  return p === 'calcom' || p === 'google';
+}
+
 export const MANAGE_TOOLS = [
   {
     type: 'function',
@@ -286,7 +293,7 @@ export async function executeTool(session, call) {
   if (name === 'take_question') return runTakeQuestion(session, args);
   if (name === 'take_message') return runTakeMessage(session, args);
   if (name === 'check_availability' || name === 'book_appointment' || name === 'reschedule_appointment' || name === 'cancel_appointment') {
-    if ((name === 'reschedule_appointment' || name === 'cancel_appointment') && calendarProvider(session) !== 'calcom') {
+    if ((name === 'reschedule_appointment' || name === 'cancel_appointment') && !canManageAppointments(session)) {
       return { ok: false, error: 'unknown_tool' };
     }
     const result = name === 'check_availability' ? await runAvailability(session, args)
@@ -732,7 +739,7 @@ async function runBooking(session, args) {
   return { ok: false, error: 'booking_failed', instruction: 'The booking did not go through. Do not claim it did. Take their details and say the team will follow up.' };
 }
 
-// ---- change / cancel an existing appointment (Cal.com only) ------------------
+// ---- change / cancel an existing appointment (Cal.com direct, or Google via n8n) ------------------
 
 const MAX_MANAGE_LOOKUPS = 3; // per call
 
@@ -752,7 +759,8 @@ function nameMatches(a, b) {
   return tokens(a).some((t) => other.has(t));
 }
 
-async function resolveBooking(session, args, tz) {
+// Shared checks before touching any calendar: name + email present and read back, lookup limit.
+function checkManageDetails(session, args) {
   const name = String(session.confirmedName || args.name || '').trim();
   const email = String(args.email || '').trim().toLowerCase();
   if (name.length < 2 || !EMAIL_RE.test(email)) {
@@ -765,6 +773,57 @@ async function resolveBooking(session, args, tz) {
     return { fail: { ok: false, error: 'limit_reached', instruction: 'Do not look again. Offer to have the team follow up.' } };
   }
   session.manageLookups = (session.manageLookups || 0) + 1;
+  return { name, email };
+}
+
+// Google (and any calendar the workflow supports) via n8n: the workflow finds the event itself
+// from name/email (+ the day/time the caller named) and returns a status + code.
+async function manageViaN8n(session, tz, kind, args, { name, email, newStartTime }) {
+  const payload = {
+    userId: session.userId,
+    provider: 'google',
+    tool: kind === 'cancel' ? 'cancelAppointment' : 'rescheduleAppointment',
+    name,
+    email,
+    timeZone: tz,
+  };
+  const d = String(args.current_date || '').trim();
+  if (isRealDate(d)) payload.currentDate = d;
+  const t = String(args.current_time || '').trim();
+  if (TIME_RE.test(t)) payload.currentTime = t;
+  if (kind === 'cancel') {
+    const reason = String(args.reason || '').trim().slice(0, 100);
+    if (reason) payload.reason = reason;
+  } else {
+    payload.newStartTime = newStartTime;
+  }
+
+  const res = await triggerAutomation(session.env, kind === 'cancel' ? 'cancel_appointment' : 'reschedule_appointment', payload);
+  if (!res) {
+    return { fail: { ok: false, error: 'lookup_failed', instruction: 'You could not reach the calendar. Offer to take a message so the team can follow up.' } };
+  }
+  if (isInsufficientCredits(res)) {
+    return { fail: { ok: false, error: 'service_unavailable', instruction: 'Scheduling is not available right now. Offer to take a message so the team can follow up.' } };
+  }
+  if (res.status === true) return { res };
+  if (res.code === 'not_found') {
+    return { fail: { ok: false, error: 'no_booking_found', instruction: 'You could not find an upcoming appointment under that name and email. Do not guess or hint at other details. Ask once whether it was booked under a different email; otherwise offer to take a message for the team.' } };
+  }
+  if (res.code === 'ambiguous') {
+    const options = (Array.isArray(res.appointments) ? res.appointments : [])
+      .map((a) => Date.parse(a.start)).filter(Number.isFinite).map((ms) => whenLabel(ms, tz));
+    return { fail: { ok: false, error: 'which_booking', options, instruction: 'They have more than one upcoming appointment. Read these out and ask which one they mean, then call again with current_date set to that day (YYYY-MM-DD from the Upcoming days list) and, if two are on the same day, current_time as 24-hour HH:MM.' } };
+  }
+  if (res.code === 'slot_taken') {
+    return { fail: { ok: false, error: 'slot_taken', instruction: 'That time was just taken. Apologise briefly and offer another time.' } };
+  }
+  return { fail: { ok: false, error: 'booking_failed', instruction: kind === 'cancel' ? 'The cancellation did not go through. Do not claim it did. Say the team will follow up to sort it out.' : 'The change did not go through. Do not claim it did. Say the team will follow up to sort it out.' } };
+}
+
+async function resolveBooking(session, args, tz) {
+  const checked = checkManageDetails(session, args);
+  if (checked.fail) return checked;
+  const { name, email } = checked;
 
   const found = await calcom.findBookings(session, { email });
   if (!found.ok) {
@@ -809,6 +868,26 @@ async function runReschedule(session, args) {
   if (!open) return { ok: false, error: 'availability_not_checked', instruction: 'Ask which day they want, so the calendar for that day gets checked, then offer real open times.' };
   if (!open.has(instant.getTime())) return { ok: false, error: 'time_not_open', instruction: 'That exact time is not open. Offer one of the open times from the availability result.' };
 
+  if (calendarProvider(session) !== 'calcom') {
+    const checked = checkManageDetails(session, args);
+    if (checked.fail) return checked.fail;
+    const { offset } = localToInstant(newDate, newTime, tz);
+    const out = await manageViaN8n(session, tz, 'reschedule', args, { ...checked, newStartTime: `${newDate}T${newTime}:00${offset}` });
+    if (out.fail) {
+      if (out.fail.error === 'slot_taken') session.availabilityCache.delete(newDate);
+      return out.fail;
+    }
+    session.bookingConfirmed = { name: checked.name, date: newDate, time: newTime };
+    session.capturedContact = { name: checked.name, email: checked.email };
+    const oldMs = Date.parse(out.res.oldStartTime || '');
+    return {
+      ok: true, rescheduled: true,
+      ...(Number.isFinite(oldMs) ? { from: whenLabel(oldMs, tz) } : {}),
+      to: whenLabel(instant.getTime(), tz),
+      instruction: 'Confirm the new time in one short sentence. They will get an updated confirmation by email.',
+    };
+  }
+
   const res = await resolveBooking(session, args, tz);
   if (res.fail) return res.fail;
 
@@ -833,6 +912,19 @@ async function runReschedule(session, args) {
 
 async function runCancel(session, args) {
   const tz = businessTimeZone(session);
+  if (calendarProvider(session) !== 'calcom') {
+    const checked = checkManageDetails(session, args);
+    if (checked.fail) return checked.fail;
+    const out = await manageViaN8n(session, tz, 'cancel', args, checked);
+    if (out.fail) return out.fail;
+    session.bookingCancelled = true;
+    const wasMs = Date.parse(out.res.startTime || '');
+    return {
+      ok: true, cancelled: true,
+      ...(Number.isFinite(wasMs) ? { was: whenLabel(wasMs, tz) } : {}),
+      instruction: 'Confirm the cancellation in one short sentence, and offer to book a new time whenever suits them.',
+    };
+  }
   const res = await resolveBooking(session, args, tz);
   if (res.fail) return res.fail;
 

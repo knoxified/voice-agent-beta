@@ -4,6 +4,9 @@ function webhookMap(env) {
   return {
     book_appointment: env.N8N_WEBHOOK_BOOK || 'webhook/appointment-webhook',
     check_availability: env.N8N_WEBHOOK_BOOK || 'webhook/appointment-webhook',
+    // Same webhook: the AppointMate workflow branches on body.tool (cancelAppointment / rescheduleAppointment).
+    cancel_appointment: env.N8N_WEBHOOK_BOOK || 'webhook/appointment-webhook',
+    reschedule_appointment: env.N8N_WEBHOOK_BOOK || 'webhook/appointment-webhook',
     leadreach: env.N8N_WEBHOOK_LEADREACH || 'webhook/leadreach',
   };
 }
