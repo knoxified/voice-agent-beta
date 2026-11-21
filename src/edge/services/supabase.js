@@ -121,10 +121,45 @@ async function getUserVoiceSettings(env, userId) {
 // Usage is stored as whole SECONDS (seconds_used) so a 2-second call costs
 // 2 seconds, not a full minute. Rows written by the old minutes-only function
 // have seconds_used = 0 and minutes_used > 0, so fall back to minutes * 60.
+// Adds whole months in UTC, clamping the day (Jan 31 + 1 month = Feb 28/29).
+function addMonthsUTC(anchor, months) {
+  const target = new Date(Date.UTC(
+    anchor.getUTCFullYear(), anchor.getUTCMonth() + months, 1,
+    anchor.getUTCHours(), anchor.getUTCMinutes(), anchor.getUTCSeconds(), anchor.getUTCMilliseconds()
+  ));
+  const daysInMonth = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0)).getUTCDate();
+  target.setUTCDate(Math.min(anchor.getUTCDate(), daysInMonth));
+  return target;
+}
+
+// Start of the customer's current monthly usage window. Anchored to their last payment
+// (users.billing_period_start, set by the dashboard's payment webhook) so minutes refresh
+// on their billing date. Anything missing or odd falls back to the calendar month, which
+// is exactly what this function did before -- so it can only ever behave as it did.
+async function getUsageWindowStart(supabase, userId) {
+  const now = new Date();
+  const calendarMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('billing_period_start')
+      .eq('id', userId)
+      .single();
+    if (error || !data?.billing_period_start) return calendarMonthStart;
+    const anchor = new Date(data.billing_period_start);
+    if (isNaN(anchor.getTime()) || anchor.getTime() > now.getTime()) return calendarMonthStart;
+    let k = (now.getUTCFullYear() - anchor.getUTCFullYear()) * 12 + (now.getUTCMonth() - anchor.getUTCMonth());
+    while (k > 0 && addMonthsUTC(anchor, k).getTime() > now.getTime()) k--;
+    while (addMonthsUTC(anchor, k + 1).getTime() <= now.getTime()) k++;
+    return addMonthsUTC(anchor, k);
+  } catch (err) {
+    console.error('[Supabase] getUsageWindowStart error, using calendar month:', err.message);
+    return calendarMonthStart;
+  }
+}
+
 async function getUsedSecondsThisMonth(supabase, userId) {
-  const startOfMonth = new Date();
-  startOfMonth.setDate(1);
-  startOfMonth.setHours(0, 0, 0, 0);
+  const startOfMonth = await getUsageWindowStart(supabase, userId);
 
   const { data, error } = await supabase
     .from('voice_usage')
