@@ -8,6 +8,7 @@ import { pickRelevant, splitChunks } from '../services/knowledge.js';
 import { parseDayMention, parseTimeMention, matchSlot, dayLabel, upcomingList } from '../services/scheduling.js';
 import { sanitizeRules, matchRoutingRule, isValidE164 } from '../services/routing.js';
 import { telnyxTransfer, telnyxHangup } from '../services/telnyx.js';
+import { signalwireTransfer } from '../services/signalwire.js';
 import { getKnownCaller, saveContactToLead, saveLeadCallDetails,
   getUserById,
   getUserVoiceSettings,
@@ -35,6 +36,7 @@ export class CallSession {
     this.userId = null;
     this.callerNumber = null;
     this.provider = null;
+    this.carrier = null; // 'signalwire' | 'twilio' on cXML calls, used to pick the transfer API
     this.isWebCall = false;
     this.isBrowserCall = false; // browser-direct web call: no Twilio/Telnyx
     this.isTrial = false;
@@ -197,6 +199,7 @@ export class CallSession {
     this.userId = url.searchParams.get('userId');
     this.callerNumber = url.searchParams.get('callerNumber') || null;
     this.provider = url.searchParams.get('provider') || 'web';
+    this.carrier = url.searchParams.get('carrier') || null;
     this.isWebCall = this.provider === 'web';
     this.isBrowserCall = this.provider === 'browser';
     if (this.isBrowserCall) {
@@ -312,6 +315,9 @@ export class CallSession {
       }
       if (msg.start?.customParameters?.callerNumber) {
         this.callerNumber = msg.start.customParameters.callerNumber;
+      }
+      if (msg.start?.customParameters?.carrier) {
+        this.carrier = msg.start.customParameters.carrier;
       }
       if (msg.start?.customParameters?.provider) {
         this.provider = msg.start.customParameters.provider;
@@ -1429,7 +1435,8 @@ export class CallSession {
     }
 
     // action === 'transfer'
-    if (this.provider !== 'telnyx') {
+    const viaSignalwire = this.provider === 'twilio' && this.carrier === 'signalwire';
+    if (this.provider !== 'telnyx' && !viaSignalwire) {
       console.warn(`[Routing] transfer not supported on provider "${this.provider}" -- falling through`);
       return false;
     }
@@ -1440,10 +1447,12 @@ export class CallSession {
 
     this.transferInProgress = true;
     await this.speakLine("One moment, I'll connect you now.");
-    // Let the spoken line finish playing before Telnyx bridges the call.
+    // Let the spoken line finish playing before the carrier bridges the call.
     await new Promise((r) => setTimeout(r, 2500));
 
-    const result = await telnyxTransfer(this.env, this.callId, this.transferNumber);
+    const result = viaSignalwire
+      ? await signalwireTransfer(this.env, this.callId, this.transferNumber)
+      : await telnyxTransfer(this.env, this.callId, this.transferNumber);
     if (!result.ok) {
       this.transferInProgress = false;
       await this.speakLine("I'm sorry, I couldn't connect you just now. Is there anything else I can help with?");

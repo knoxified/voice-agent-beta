@@ -3,6 +3,7 @@ import { cors } from 'hono/cors';
 import { mintVoiceAccessToken } from './services/twilioToken.js';
 import { signWebcallToken, verifyWebcallToken } from './services/webcallToken.js';
 import { telnyxAnswer, telnyxSpeak, telnyxHangup, telnyxStreamingStart } from './services/telnyx.js';
+import { verifyTransferToken, transferTwiml } from './services/signalwire.js';
 import { getUserById, getUserByPhone, checkQuota, logUnmatchedInboundCall, getUserVoiceSettings, getAgentConfig, saveCallRecordingUrl } from './services/supabase.js';
 import { synthesizeSpeech } from './services/tts.js';
 import { buildGreeting } from './services/greeting.js';
@@ -308,10 +309,14 @@ async function handleTwilioInbound(c, body) {
     c.executionCtx.waitUntil(startTwilioRecording(c.env, CallSid, statusCallbackUrl));
   }
 
+  // SignalWire speaks the same cXML as Twilio, so both land here. Only the
+  // carrier differs, and live transfers need to know which REST API to call.
+  const carrier = c.req.header('x-signalwire-signature') ? 'signalwire' : 'twilio';
+
   const host = new URL(c.req.url).host;
   const streamUrl =
     `wss://${host}/voice/stream/${CallSid}` +
-    `?userId=${encodeURIComponent(user.id)}&callerNumber=${encodeURIComponent(From)}&provider=twilio`;
+    `?userId=${encodeURIComponent(user.id)}&callerNumber=${encodeURIComponent(From)}&provider=twilio&carrier=${carrier}`;
 
   return twimlResponse(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -320,10 +325,21 @@ async function handleTwilioInbound(c, body) {
       <Parameter name="userId" value="${escapeXml(user.id)}" />
       <Parameter name="callerNumber" value="${escapeXml(From)}" />
       <Parameter name="provider" value="twilio" />
+      <Parameter name="carrier" value="${carrier}" />
     </Stream>
   </Connect>
 </Response>`);
 }
+
+// SignalWire fetches this after signalwireTransfer() redirects a live call.
+// The token is signed, expires in 2 minutes, and is bound to this CallSid and
+// the destination, so nobody can use the URL to dial an arbitrary number.
+app.post('/voice/transfer-twiml', async (c) => {
+  const body = await parseInboundBody(c.req);
+  const claims = await verifyTransferToken(c.env, c.req.query('t'), body.CallSid);
+  if (!claims) return c.text('Forbidden', 403);
+  return twimlResponse(transferTwiml(c.env, claims.to));
+});
 
 async function handleTelnyxInbound(c, body) {
   const event = body.data;
